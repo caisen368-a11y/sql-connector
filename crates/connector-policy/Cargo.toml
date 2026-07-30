@@ -1,0 +1,27 @@
+[package]
+name = "connector-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+connector-core = { path = "../connector-core" }
+ed25519-dalek.workspace = true
+globset.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlparser = { version = "=0.59.0", features = ["visitor"] }
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+
+[lints]
+workspace = true

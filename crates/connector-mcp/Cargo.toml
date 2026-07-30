@@ -1,0 +1,33 @@
+[package]
+name = "connector-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+connector-core = { path = "../connector-core" }
+connector-policy = { path = "../connector-policy" }
+connector-runtime = { path = "../connector-runtime" }
+rmcp.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+connector-control = { path = "../connector-control" }
+connector-ipc = { path = "../connector-ipc" }
+connector-store = { path = "../connector-store" }
+connectors-document = { path = "../connectors-document", default-features = false, features = ["mongodb", "cassandra", "couchbase", "hbase"] }
+connectors-http = { path = "../connectors-http" }
+connectors-sql = { path = "../connectors-sql" }
+rmcp = { workspace = true, features = ["client"] }
+
+[lints]
+workspace = true

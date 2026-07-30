@@ -1,0 +1,37 @@
+[package]
+name = "connectors-sql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+bytes = "1.10.1"
+chrono.workspace = true
+connection-string = "=0.2.0"
+connector-core = { path = "../connector-core" }
+deadpool-postgres = "=0.14.1"
+deadpool-oracle = "=0.1.1"
+futures-util = "0.3.31"
+moka = { version = "=0.12.15", features = ["sync"] }
+mysql_async = { version = "=0.36.1", default-features = false, features = ["default-rustls-ring"] }
+oracle-rs = "=0.1.7"
+postgres-types = { version = "=0.2.11", features = ["derive", "with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+rustls = { version = "0.23.35", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2.2.0"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
+sqlparser = { version = "=0.59.0", features = ["visitor"] }
+tiberius = { version = "=0.12.3", default-features = false, features = ["chrono", "rustls", "tds73", "tokio"] }
+tokio.workspace = true
+tokio-postgres = { version = "=0.7.15", default-features = false, features = ["runtime", "with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+tokio-postgres-rustls = "=0.13.0"
+tokio-util = { workspace = true, features = ["compat", "rt"] }
+url.workspace = true
+uuid.workspace = true
+webpki-roots = "1.0.3"
+
+[lints]
+workspace = true

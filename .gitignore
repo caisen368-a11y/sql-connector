@@ -1,0 +1,10 @@
+/target/
+/.idea/
+/.vscode/
+/.DS_Store
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+/connector-data/
+/sql-temp-test/

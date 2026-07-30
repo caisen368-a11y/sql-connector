@@ -1,0 +1,86 @@
+name: desktop-ui
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "ui/**"
+      - "apps/sql-connector/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/desktop-ui.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package ${{ matrix.artifact }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            bundle: dmg
+            artifact: sql-agent-macos-x86_64
+            bundle_path: ui/src-tauri/target/x86_64-apple-darwin/release/bundle/dmg
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            bundle: dmg
+            artifact: sql-agent-macos-aarch64
+            bundle_path: ui/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            bundle: nsis
+            artifact: sql-agent-windows-x86_64
+            bundle_path: ui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.1
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            ui/src-tauri -> target
+
+      - name: Install frontend dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Build and stage sql-connector sidecar
+        run: >-
+          node ui/scripts/prepare-sidecar.mjs
+          --target ${{ matrix.target }}
+          --profile release
+
+      - name: Build unsigned desktop bundle
+        working-directory: ui
+        run: >-
+          npm run tauri -- build
+          --target ${{ matrix.target }}
+          --bundles ${{ matrix.bundle }}
+
+      - name: Write SHA-256 checksums
+        run: node ui/scripts/write-checksums.mjs "${{ matrix.bundle_path }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.bundle_path }}/*
+          if-no-files-found: error

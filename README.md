@@ -6,11 +6,12 @@ document, wide-column, time-series, search, log, and vector databases.
 
 The desktop host owns connection administration and authorization. MCP tools
 receive only an opaque `connection_id`; credentials are written through the
-trusted `control` command and stored in macOS Keychain or Windows Credential
-Manager. Connections are read-only by default. Writes require both an allowed
-connection policy and, for destructive/native operations, a short-lived signed
-one-use grant bound to the exact session, tool, arguments, limits, and policy
-version.
+trusted `control` command. The default backend is macOS Keychain or Windows
+Credential Manager. Desktop hosts may instead select AES-256-GCM encrypted
+SQLite storage with a separate caller-managed 32-byte key file. Connections are
+read-only by default. Writes require both an allowed connection policy and, for
+destructive/native operations, a short-lived signed one-use grant bound to the
+exact session, tool, arguments, limits, and policy version.
 
 ## Build
 
@@ -58,6 +59,21 @@ Local authorization creates the Ed25519 key in Keychain or Credential Manager
 and lets the trusted `authorize` command sign confirmed writes. An external
 signer can instead use `--authorization-public-key`. Omit both modes only for
 read-only development; operations requiring confirmation will then be rejected.
+
+To keep credentials encrypted in SQLite, pass the same data directory and raw
+32-byte key file to every trusted command and MCP process:
+
+```bash
+sql-connector --data-dir ./connector-data \
+  --credential-store sqlite \
+  --credential-key-file ./private/credentials.key \
+  mcp --local-authorization \
+  --session-id DESKTOP_GENERATED_SESSION_ID
+```
+
+The SQLite file never contains plaintext credential values. The key file is not
+stored in SQLite and must be protected separately. Losing it makes the stored
+credentials unrecoverable; obtaining both files allows decryption.
 
 The trusted desktop host can create and manage profiles by sending one JSON
 object to `control` over stdin. Secrets must never be placed in command-line

@@ -1,5 +1,25 @@
 # Configuration
 
+## Encrypted SQLite credential storage
+
+The default credential backend remains macOS Keychain or Windows Credential
+Manager. A desktop host that requires credentials in SQLite can select the
+encrypted backend explicitly. It must create a file containing exactly 32
+cryptographically random bytes and pass the same paths to every command:
+
+```bash
+sql-connector --data-dir /private/agent-data \
+  --credential-store sqlite \
+  --credential-key-file /private/agent-keys/credentials.key \
+  control < request.json
+```
+
+Credential payloads, TLS private material, and the local authorization signing
+key are encrypted with AES-256-GCM in `credentials.sqlite`. Profiles and audit
+metadata remain in their existing plaintext SQLite databases. The connector
+does not create, print, rotate, or recover the key file. Do not place its bytes
+in command arguments, JSON requests, logs, or MCP messages.
+
 ## Test and add a connection
 
 The normal desktop flow uses a compact draft. The command tests the selected

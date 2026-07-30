@@ -10,7 +10,9 @@ Desktop Agent / trusted UI
   v
 sql-connector
   +-- SQLite: non-secret profiles and append-only audit records
-  +-- macOS Keychain / Windows Credential Manager: credential payloads
+  +-- credential store (selected by the trusted host)
+  |    +-- default: macOS Keychain / Windows Credential Manager
+  |    +-- optional: AES-256-GCM encrypted SQLite + separate key file
   +-- MCP 2025-11-25 stdio: connection_id and typed operations only
   +-- policy runtime: classify, authorize, limit, mask, timeout, audit
   +-- connector registry: worker-backed connector proxies
@@ -27,9 +29,11 @@ The model-facing MCP boundary cannot create, update, or delete connection
 profiles and cannot retrieve credentials. The desktop host is responsible for
 authenticating its user, protecting its grant signing key, choosing whether
 data may be sent to a cloud model, and displaying write confirmation UI.
-The built-in local authorization mode keeps that key in Keychain or Credential
-Manager; the trusted `authorize` command accepts an already confirmed MCP call
-and performs policy checking, canonical hashing, and signing outside MCP.
+The built-in local authorization mode keeps that key in the selected credential
+store; the trusted `authorize` command accepts an already confirmed MCP call and
+performs policy checking, canonical hashing, and signing outside MCP. Selecting
+SQLite requires the host to pass the same key file to every MCP and trusted
+control process. Key contents never cross MCP or command-line arguments.
 
 ## Authorization
 

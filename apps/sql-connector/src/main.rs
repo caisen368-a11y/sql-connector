@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use connector_control::{
     AuthorizationKeyManager, AuthorizationRequest, ConfirmationService, ConnectionDraft,
     ConnectionManager, ConnectionUpdateDraft, ControlError, ControlRequest, ControlService,
@@ -24,7 +24,8 @@ use connector_mcp::DatabaseMcpServer;
 use connector_policy::{AUTHORIZATION_META_KEY, GrantVerifier, PolicyError};
 use connector_runtime::{ConnectorRegistry, Runtime};
 use connector_store::{
-    AuditQuery, AuditRepository, CredentialStore, OsCredentialStore, ProfileRepository, StoreError,
+    AuditQuery, AuditRepository, CredentialStore, OsCredentialStore, ProfileRepository,
+    SqliteCredentialStore, StoreError,
 };
 use directories::ProjectDirs;
 use ed25519_dalek::VerifyingKey;
@@ -52,8 +53,25 @@ mod worker;
 struct Cli {
     #[arg(long, global = true, value_name = "DIRECTORY")]
     data_dir: Option<PathBuf>,
+    /// Credential persistence backend used by data-directory commands.
+    #[arg(long, global = true, value_enum, default_value = "os")]
+    credential_store: CredentialStoreKind,
+    /// Path to a file containing exactly 32 raw key bytes for encrypted credentials.
+    #[arg(long, global = true, value_name = "PATH")]
+    credential_key_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CredentialStoreKind {
+    Os,
+    Sqlite,
+}
+
+struct CredentialStores {
+    connections: Arc<dyn CredentialStore>,
+    authorization: Arc<dyn CredentialStore>,
 }
 
 #[derive(serde::Deserialize)]
@@ -68,7 +86,7 @@ enum Command {
         /// Base64-encoded 32-byte Ed25519 public key used to verify Host grants.
         #[arg(long, value_name = "BASE64", requires = "session_id")]
         authorization_public_key: Option<String>,
-        /// Use the signing key managed in the operating-system credential store.
+        /// Use the signing key managed in the selected credential store.
         #[arg(
             long,
             conflicts_with = "authorization_public_key",
@@ -88,7 +106,7 @@ enum Command {
     AddConnection,
     /// Test one compact connection draft without saving it.
     TestConnection,
-    /// Test one saved connection using its operating-system stored credentials.
+    /// Test one saved connection using its stored credentials.
     TestSavedConnection,
     /// Test and save a connection imported from a common connection string.
     AddConnectionString,
@@ -157,14 +175,27 @@ impl Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    let Cli { data_dir, command } = Cli::parse();
+    let Cli {
+        data_dir,
+        credential_store,
+        credential_key_file,
+        command,
+    } = Cli::parse();
     let writes_machine_readable_errors = command.writes_machine_readable_errors();
     let result = match command {
         Command::Manifests => print_manifests(),
         Command::ValidateConnection => run_validate_connection(),
         Command::ValidateConnectionString => run_validate_connection_string(),
         Command::Worker { pack } => worker::run(&pack, build_registry(Some(&pack))?).await,
-        command => run_with_data_dir(data_dir, command).await,
+        command => {
+            run_with_data_dir(
+                data_dir,
+                credential_store,
+                credential_key_file.as_deref(),
+                command,
+            )
+            .await
+        }
     };
     if writes_machine_readable_errors {
         result.or_else(emit_command_error)
@@ -173,10 +204,16 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_with_data_dir(data_dir: Option<PathBuf>, command: Command) -> Result<()> {
+async fn run_with_data_dir(
+    data_dir: Option<PathBuf>,
+    credential_store: CredentialStoreKind,
+    credential_key_file: Option<&Path>,
+    command: Command,
+) -> Result<()> {
     let data_dir = resolve_data_dir(data_dir)?;
     fs::create_dir_all(&data_dir)
         .with_context(|| format!("failed to create data directory {}", data_dir.display()))?;
+    let credentials = CredentialStores::open(&data_dir, credential_store, credential_key_file)?;
 
     match command {
         Command::Mcp {
@@ -191,24 +228,42 @@ async fn run_with_data_dir(data_dir: Option<PathBuf>, command: Command) -> Resul
                 local_authorization,
                 subject,
                 session_id,
+                &credentials,
             )
             .await
         }
-        Command::Control => run_control(&data_dir),
-        Command::AddConnection => run_add_connection(&data_dir).await,
+        Command::Control => run_control(&data_dir, Arc::clone(&credentials.connections)),
+        Command::AddConnection => {
+            run_add_connection(&data_dir, Arc::clone(&credentials.connections)).await
+        }
         Command::TestConnection => run_test_connection().await,
-        Command::TestSavedConnection => run_test_saved_connection(&data_dir).await,
-        Command::AddConnectionString => run_add_connection_string(&data_dir).await,
+        Command::TestSavedConnection => {
+            run_test_saved_connection(&data_dir, Arc::clone(&credentials.connections)).await
+        }
+        Command::AddConnectionString => {
+            run_add_connection_string(&data_dir, Arc::clone(&credentials.connections)).await
+        }
         Command::DetectConnectionString => run_detect_connection_string().await,
-        Command::AddDetectedConnectionString => run_add_detected_connection_string(&data_dir).await,
+        Command::AddDetectedConnectionString => {
+            run_add_detected_connection_string(&data_dir, Arc::clone(&credentials.connections))
+                .await
+        }
         Command::DetectEndpoint => run_detect_endpoint().await,
-        Command::AddDetectedEndpoint => run_add_detected_endpoint(&data_dir).await,
+        Command::AddDetectedEndpoint => {
+            run_add_detected_endpoint(&data_dir, Arc::clone(&credentials.connections)).await
+        }
         Command::TestConnectionString => run_test_connection_string().await,
-        Command::UpdateConnection => run_update_connection(&data_dir).await,
-        Command::UpdateConnectionString => run_update_connection_string(&data_dir).await,
-        Command::RotateCredentials => run_rotate_credentials(&data_dir).await,
-        Command::AuthorizationKey => run_authorization_key(),
-        Command::Authorize => run_authorize(&data_dir),
+        Command::UpdateConnection => {
+            run_update_connection(&data_dir, Arc::clone(&credentials.connections)).await
+        }
+        Command::UpdateConnectionString => {
+            run_update_connection_string(&data_dir, Arc::clone(&credentials.connections)).await
+        }
+        Command::RotateCredentials => {
+            run_rotate_credentials(&data_dir, Arc::clone(&credentials.connections)).await
+        }
+        Command::AuthorizationKey => run_authorization_key(Arc::clone(&credentials.authorization)),
+        Command::Authorize => run_authorize(&data_dir, Arc::clone(&credentials.authorization)),
         Command::Audit => run_audit(&data_dir),
         Command::Manifests
         | Command::ValidateConnection
@@ -247,15 +302,53 @@ fn repositories(data_dir: &Path) -> Result<(Arc<ProfileRepository>, Arc<AuditRep
     Ok((profiles, audit))
 }
 
-fn credential_store() -> Arc<OsCredentialStore> {
-    Arc::new(OsCredentialStore::new("com.sql-connector.connections"))
+impl CredentialStores {
+    fn open(data_dir: &Path, kind: CredentialStoreKind, key_file: Option<&Path>) -> Result<Self> {
+        match kind {
+            CredentialStoreKind::Os => {
+                if key_file.is_some() {
+                    bail!("--credential-key-file can only be used with --credential-store sqlite");
+                }
+                Ok(Self {
+                    connections: Arc::new(OsCredentialStore::new("com.sql-connector.connections")),
+                    authorization: Arc::new(OsCredentialStore::new(
+                        "com.sql-connector.authorization",
+                    )),
+                })
+            }
+            CredentialStoreKind::Sqlite => {
+                let key_file = key_file
+                    .context("--credential-key-file is required with --credential-store sqlite")?;
+                let key_bytes = Zeroizing::new(fs::read(key_file).with_context(|| {
+                    format!("failed to read credential key file {}", key_file.display())
+                })?);
+                let key = Arc::new(Zeroizing::new(key_bytes.as_slice().try_into().map_err(
+                    |_| {
+                        StoreError::Credential(
+                            "credential key file must contain exactly 32 raw bytes".into(),
+                        )
+                    },
+                )?));
+                let path = data_dir.join("credentials.sqlite");
+                Ok(Self {
+                    connections: Arc::new(SqliteCredentialStore::open(
+                        &path,
+                        "connections",
+                        Arc::clone(&key),
+                    )?),
+                    authorization: Arc::new(SqliteCredentialStore::open(
+                        path,
+                        "authorization",
+                        key,
+                    )?),
+                })
+            }
+        }
+    }
 }
 
-fn authorization_key_manager() -> AuthorizationKeyManager {
-    AuthorizationKeyManager::new(
-        Arc::new(OsCredentialStore::new("com.sql-connector.authorization")),
-        "host-grant-key-v1",
-    )
+fn authorization_key_manager(credentials: Arc<dyn CredentialStore>) -> AuthorizationKeyManager {
+    AuthorizationKeyManager::new(credentials, "host-grant-key-v1")
 }
 
 fn build_registry(pack: Option<&str>) -> Result<ConnectorRegistry> {
@@ -351,10 +444,12 @@ async fn run_mcp(
     local_authorization: bool,
     subject: String,
     session_id: Option<String>,
+    credentials: &CredentialStores,
 ) -> Result<()> {
     let (profiles, audit) = repositories(data_dir)?;
     let verifier = if local_authorization {
-        let key = authorization_key_manager().load_or_create()?;
+        let key =
+            authorization_key_manager(Arc::clone(&credentials.authorization)).load_or_create()?;
         Some(Arc::new(GrantVerifier::new(
             key.into_issuer().verifying_key(),
         )))
@@ -371,7 +466,7 @@ async fn run_mcp(
     let (registry, workers) = build_worker_registry().await?;
     let runtime = Arc::new(Runtime::new(
         Arc::clone(&profiles),
-        credential_store(),
+        Arc::clone(&credentials.connections),
         audit,
         Arc::new(registry),
         verifier,
@@ -501,8 +596,8 @@ async fn monitor_connection_changes(
     }
 }
 
-fn run_authorization_key() -> Result<()> {
-    let key = authorization_key_manager().load_or_create()?;
+fn run_authorization_key(credentials: Arc<dyn CredentialStore>) -> Result<()> {
+    let key = authorization_key_manager(credentials).load_or_create()?;
     serde_json::to_writer(
         io::stdout().lock(),
         &serde_json::json!({
@@ -514,7 +609,7 @@ fn run_authorization_key() -> Result<()> {
     Ok(())
 }
 
-fn run_authorize(data_dir: &Path) -> Result<()> {
+fn run_authorize(data_dir: &Path, credentials: Arc<dyn CredentialStore>) -> Result<()> {
     let mut input = Zeroizing::new(String::new());
     io::stdin()
         .read_to_string(&mut input)
@@ -527,7 +622,7 @@ fn run_authorize(data_dir: &Path) -> Result<()> {
     let profiles = Arc::new(ProfileRepository::open(
         data_dir.join("connections.sqlite"),
     )?);
-    let key = authorization_key_manager().load_or_create()?;
+    let key = authorization_key_manager(credentials).load_or_create()?;
     let public_key = key.public_key_base64();
     let grant = ConfirmationService::new(profiles, key.into_issuer()).issue_mcp(&request)?;
     serde_json::to_writer(
@@ -561,7 +656,7 @@ fn run_audit(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_control(data_dir: &Path) -> Result<()> {
+fn run_control(data_dir: &Path, credentials: Arc<dyn CredentialStore>) -> Result<()> {
     let (profiles, _) = repositories(data_dir)?;
     let mut input = Zeroizing::new(String::new());
     io::stdin()
@@ -572,7 +667,6 @@ fn run_control(data_dir: &Path) -> Result<()> {
     }
     let request: ControlRequest =
         serde_json::from_str(&input).context("control request is not valid JSON")?;
-    let credentials = credential_store();
     validate_control_request(&request, &profiles, credentials.as_ref())?;
     let response = ControlService::new(profiles, credentials).execute(request)?;
     serde_json::to_writer(io::stdout().lock(), &response)
@@ -610,7 +704,7 @@ fn validate_control_request(
     }
 }
 
-async fn run_add_connection(data_dir: &Path) -> Result<()> {
+async fn run_add_connection(data_dir: &Path, credentials: Arc<dyn CredentialStore>) -> Result<()> {
     let mut input = Zeroizing::new(String::new());
     io::stdin()
         .read_to_string(&mut input)
@@ -624,8 +718,7 @@ async fn run_add_connection(data_dir: &Path) -> Result<()> {
     let connection_info = test_draft_connection("add-connection", &profile, &secret).await?;
 
     let (profiles, _) = repositories(data_dir)?;
-    let connection =
-        ConnectionManager::new(profiles, credential_store()).create(&profile, &secret)?;
+    let connection = ConnectionManager::new(profiles, credentials).create(&profile, &secret)?;
     serde_json::to_writer(
         io::stdout().lock(),
         &serde_json::json!({
@@ -657,7 +750,10 @@ async fn run_test_connection() -> Result<()> {
     Ok(())
 }
 
-async fn run_test_saved_connection(data_dir: &Path) -> Result<()> {
+async fn run_test_saved_connection(
+    data_dir: &Path,
+    credentials: Arc<dyn CredentialStore>,
+) -> Result<()> {
     let mut input = Zeroizing::new(String::new());
     io::stdin()
         .read_to_string(&mut input)
@@ -669,7 +765,7 @@ async fn run_test_saved_connection(data_dir: &Path) -> Result<()> {
         serde_json::from_str(&input).context("saved connection request is not valid JSON")?;
     let (profiles, _) = repositories(data_dir)?;
     let profile = profiles.get(request.connection_id)?;
-    let secret = credential_store().get(&profile.secret_ref)?;
+    let secret = credentials.get(&profile.secret_ref)?;
     let connection_info = test_draft_connection("test-saved-connection", &profile, &secret).await?;
     serde_json::to_writer(
         io::stdout().lock(),
@@ -682,14 +778,16 @@ async fn run_test_saved_connection(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run_add_connection_string(data_dir: &Path) -> Result<()> {
+async fn run_add_connection_string(
+    data_dir: &Path,
+    credentials: Arc<dyn CredentialStore>,
+) -> Result<()> {
     let draft = connection_string::read_connection_string_draft()?;
     let (profile, secret) = draft.into_profile_and_secret();
     let connection_info = test_draft_connection("add-connection-string", &profile, &secret).await?;
 
     let (profiles, _) = repositories(data_dir)?;
-    let connection =
-        ConnectionManager::new(profiles, credential_store()).create(&profile, &secret)?;
+    let connection = ConnectionManager::new(profiles, credentials).create(&profile, &secret)?;
     serde_json::to_writer(
         io::stdout().lock(),
         &serde_json::json!({
@@ -722,13 +820,15 @@ async fn run_detect_connection_string() -> Result<()> {
     Ok(())
 }
 
-async fn run_add_detected_connection_string(data_dir: &Path) -> Result<()> {
+async fn run_add_detected_connection_string(
+    data_dir: &Path,
+    credentials: Arc<dyn CredentialStore>,
+) -> Result<()> {
     let probe = connection_string::read_connection_string_probe()?;
     let (profile, secret, connection_info) =
         probe_connection_string("add-detected-connection-string", &probe).await?;
     let (profiles, _) = repositories(data_dir)?;
-    let connection =
-        ConnectionManager::new(profiles, credential_store()).create(&profile, &secret)?;
+    let connection = ConnectionManager::new(profiles, credentials).create(&profile, &secret)?;
     serde_json::to_writer(
         io::stdout().lock(),
         &serde_json::json!({
@@ -764,14 +864,16 @@ async fn run_detect_endpoint() -> Result<()> {
     Ok(())
 }
 
-async fn run_add_detected_endpoint(data_dir: &Path) -> Result<()> {
+async fn run_add_detected_endpoint(
+    data_dir: &Path,
+    credentials: Arc<dyn CredentialStore>,
+) -> Result<()> {
     let probe = endpoint_probe::read_endpoint_probe()?;
     let (candidate, _) = probe_endpoint("add-detected-endpoint-probe", &probe).await?;
     let (profile, secret) = probe.connection_draft(candidate).into_profile_and_secret();
     let connection_info = test_draft_connection("add-detected-endpoint", &profile, &secret).await?;
     let (profiles, _) = repositories(data_dir)?;
-    let connection =
-        ConnectionManager::new(profiles, credential_store()).create(&profile, &secret)?;
+    let connection = ConnectionManager::new(profiles, credentials).create(&profile, &secret)?;
     serde_json::to_writer(
         io::stdout().lock(),
         &serde_json::json!({
@@ -841,7 +943,10 @@ fn run_validate_connection() -> Result<()> {
     Ok(())
 }
 
-async fn run_update_connection(data_dir: &Path) -> Result<()> {
+async fn run_update_connection(
+    data_dir: &Path,
+    credentials: Arc<dyn CredentialStore>,
+) -> Result<()> {
     let mut input = Zeroizing::new(String::new());
     io::stdin()
         .read_to_string(&mut input)
@@ -853,7 +958,6 @@ async fn run_update_connection(data_dir: &Path) -> Result<()> {
         serde_json::from_str(&input).context("connection update is not valid JSON")?;
     let (profiles, _) = repositories(data_dir)?;
     let existing = profiles.get(draft.connection_id)?;
-    let credentials = credential_store();
     let existing_secret = credentials.get(&existing.secret_ref)?;
     let (profile, secret) = draft.into_profile_and_secret(&existing, existing_secret);
     let connection_info = test_draft_connection("update-connection", &profile, &secret).await?;
@@ -870,11 +974,13 @@ async fn run_update_connection(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run_update_connection_string(data_dir: &Path) -> Result<()> {
+async fn run_update_connection_string(
+    data_dir: &Path,
+    credentials: Arc<dyn CredentialStore>,
+) -> Result<()> {
     let draft = connection_string::read_connection_string_update()?;
     let (profiles, _) = repositories(data_dir)?;
     let existing = profiles.get(draft.connection_id())?;
-    let credentials = credential_store();
     let existing_secret = credentials.get(&existing.secret_ref)?;
     let (profile, secret) = draft.into_profile_and_secret(&existing, existing_secret);
     let connection_info =
@@ -892,7 +998,10 @@ async fn run_update_connection_string(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run_rotate_credentials(data_dir: &Path) -> Result<()> {
+async fn run_rotate_credentials(
+    data_dir: &Path,
+    credentials: Arc<dyn CredentialStore>,
+) -> Result<()> {
     let mut input = Zeroizing::new(String::new());
     io::stdin()
         .read_to_string(&mut input)
@@ -906,7 +1015,7 @@ async fn run_rotate_credentials(data_dir: &Path) -> Result<()> {
     let profile = profiles.get(draft.connection_id)?;
     let secret = draft.into_secret(&profile);
     let connection_info = test_draft_connection("rotate-credentials", &profile, &secret).await?;
-    ConnectionManager::new(profiles, credential_store()).replace_secret(profile.id, &secret)?;
+    ConnectionManager::new(profiles, credentials).replace_secret(profile.id, &secret)?;
     serde_json::to_writer(
         io::stdout().lock(),
         &serde_json::json!({

@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fs,
     io::Write,
     process::{Command, Stdio},
     sync::Arc,
@@ -290,4 +291,143 @@ fn worker_rejects_unknown_pack_before_opening_ipc() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown connector pack"));
+}
+
+#[test]
+fn storage_free_command_does_not_require_a_sqlite_key_file() {
+    let temporary = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sql-connector"))
+        .arg("--data-dir")
+        .arg(temporary.path())
+        .arg("--credential-store")
+        .arg("sqlite")
+        .arg("manifests")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!temporary.path().join("credentials.sqlite").exists());
+}
+
+#[test]
+fn sqlite_authorization_key_is_encrypted_and_reused_across_processes() {
+    let binary = env!("CARGO_BIN_EXE_sql-connector");
+    let temporary = tempfile::tempdir().unwrap();
+    let key_file = temporary.path().join("credentials.key");
+    fs::write(&key_file, [0x41; 32]).unwrap();
+
+    let run = || {
+        Command::new(binary)
+            .arg("--data-dir")
+            .arg(temporary.path())
+            .arg("--credential-store")
+            .arg("sqlite")
+            .arg("--credential-key-file")
+            .arg(&key_file)
+            .arg("authorization-key")
+            .output()
+            .unwrap()
+    };
+    let first = run();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["created"], true);
+
+    let second = run();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second["created"], false);
+    assert_eq!(
+        first["authorization_public_key"],
+        second["authorization_public_key"]
+    );
+
+    let database = fs::read(temporary.path().join("credentials.sqlite")).unwrap();
+    assert!(
+        !database
+            .windows(b"ed25519_private_key".len())
+            .any(|window| window == b"ed25519_private_key")
+    );
+
+    let wrong_key_file = temporary.path().join("wrong.key");
+    fs::write(&wrong_key_file, [0x42; 32]).unwrap();
+    let wrong_key = Command::new(binary)
+        .arg("--data-dir")
+        .arg(temporary.path())
+        .arg("--credential-store")
+        .arg("sqlite")
+        .arg("--credential-key-file")
+        .arg(wrong_key_file)
+        .arg("authorization-key")
+        .output()
+        .unwrap();
+    assert!(!wrong_key.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&wrong_key.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "credential_store_error");
+}
+
+#[test]
+fn credential_key_file_is_rejected_for_the_os_store() {
+    let temporary = tempfile::tempdir().unwrap();
+    let key_file = temporary.path().join("credentials.key");
+    fs::write(&key_file, [0x41; 32]).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sql-connector"))
+        .arg("--data-dir")
+        .arg(temporary.path())
+        .arg("--credential-store")
+        .arg("os")
+        .arg("--credential-key-file")
+        .arg(key_file)
+        .arg("authorization-key")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("can only be used with --credential-store sqlite")
+    );
+}
+
+#[test]
+fn sqlite_credential_key_file_requires_32_raw_bytes() {
+    let temporary = tempfile::tempdir().unwrap();
+    let key_file = temporary.path().join("credentials.key");
+    fs::write(&key_file, [0x41; 31]).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sql-connector"))
+        .arg("--data-dir")
+        .arg(temporary.path())
+        .arg("--credential-store")
+        .arg("sqlite")
+        .arg("--credential-key-file")
+        .arg(key_file)
+        .arg("authorization-key")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "credential_store_error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("exactly 32 raw bytes")
+    );
+    assert!(!temporary.path().join("credentials.sqlite").exists());
 }

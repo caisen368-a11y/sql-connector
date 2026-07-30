@@ -23,6 +23,7 @@ license = "UNLICENSED"
 repository = "https://github.com/example/sql-connector"
 
 [workspace.dependencies]
+aes-gcm = { version = "0.10.3", features = ["zeroize"] }
 async-trait = "0.1.89"
 anyhow = "1.0.100"
 base64 = "0.22.1"

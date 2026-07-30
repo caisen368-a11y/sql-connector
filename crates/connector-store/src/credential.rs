@@ -1,6 +1,16 @@
-use std::{collections::HashMap, sync::RwLock};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex, RwLock},
+};
 
+use aes_gcm::{
+    Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit, Payload},
+};
 use connector_core::SecretMaterial;
+use rand::{RngCore, rngs::OsRng};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "windows")]
@@ -12,6 +22,325 @@ pub trait CredentialStore: Send + Sync {
     fn put(&self, reference: &str, secret: &SecretMaterial) -> Result<()>;
     fn get(&self, reference: &str) -> Result<SecretMaterial>;
     fn delete(&self, reference: &str) -> Result<()>;
+}
+
+const SQLITE_ENCRYPTION_VERSION: i64 = 1;
+const SQLITE_NONCE_BYTES: usize = 12;
+const SQLITE_KEY_CHECK_NAME: &str = "key-check";
+const SQLITE_KEY_CHECK_AAD: &[u8] = b"sql-connector-credential-store-key-check-v1";
+const SQLITE_KEY_CHECK_PLAINTEXT: &[u8] = b"sql-connector credential key verified";
+
+struct EncryptedCredentialRecord {
+    namespace: String,
+    reference: String,
+    version: i64,
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
+/// `SQLite` credential storage encrypted with one caller-managed AES-256 key.
+pub struct SqliteCredentialStore {
+    connection: Mutex<Connection>,
+    key: Arc<Zeroizing<[u8; 32]>>,
+    namespace: String,
+}
+
+impl SqliteCredentialStore {
+    pub fn open(
+        path: impl AsRef<Path>,
+        namespace: impl Into<String>,
+        key: Arc<Zeroizing<[u8; 32]>>,
+    ) -> Result<Self> {
+        let mut connection = Connection::open(path)?;
+        connection.execute_batch(
+            "PRAGMA busy_timeout=5000;
+             PRAGMA journal_mode=WAL;",
+        )?;
+        Self::verify_or_initialize_key(&mut connection, &key)?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+            key,
+            namespace: namespace.into(),
+        })
+    }
+
+    fn verify_or_initialize_key(
+        connection: &mut Connection,
+        key: &Zeroizing<[u8; 32]>,
+    ) -> Result<()> {
+        let cipher = Self::cipher_for_key(key.as_ref());
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS credentials (
+                 namespace TEXT NOT NULL,
+                 reference TEXT NOT NULL,
+                 version INTEGER NOT NULL,
+                 nonce BLOB NOT NULL,
+                 ciphertext BLOB NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 PRIMARY KEY(namespace, reference)
+             );
+             CREATE TABLE IF NOT EXISTS credential_store_metadata (
+                 name TEXT PRIMARY KEY,
+                 version INTEGER NOT NULL,
+                 nonce BLOB NOT NULL,
+                 ciphertext BLOB NOT NULL
+             );",
+        )?;
+
+        let marker: Option<(i64, Vec<u8>, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT version, nonce, ciphertext FROM credential_store_metadata
+                 WHERE name=?1",
+                [SQLITE_KEY_CHECK_NAME],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((version, nonce, ciphertext)) = marker {
+            Self::verify_key_marker(&cipher, version, nonce, &ciphertext)?;
+        } else {
+            Self::verify_existing_credentials(&transaction, &cipher)?;
+            Self::insert_key_marker(&transaction, &cipher)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn verify_key_marker(
+        cipher: &Aes256Gcm,
+        version: i64,
+        nonce: Vec<u8>,
+        ciphertext: &[u8],
+    ) -> Result<()> {
+        if version != SQLITE_ENCRYPTION_VERSION {
+            return Err(StoreError::Credential(format!(
+                "unsupported credential key-check version {version}"
+            )));
+        }
+        let nonce: [u8; SQLITE_NONCE_BYTES] = nonce.try_into().map_err(|_| {
+            StoreError::Credential("stored credential key-check nonce has an invalid length".into())
+        })?;
+        let plaintext = Zeroizing::new(
+            cipher
+                .decrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: ciphertext,
+                        aad: SQLITE_KEY_CHECK_AAD,
+                    },
+                )
+                .map_err(|_| {
+                    StoreError::Credential(
+                        "credential key verification failed; the key or stored data is invalid"
+                            .into(),
+                    )
+                })?,
+        );
+        if plaintext.as_slice() != SQLITE_KEY_CHECK_PLAINTEXT {
+            return Err(StoreError::Credential(
+                "credential key verification failed; the key or stored data is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_existing_credentials(
+        transaction: &Transaction<'_>,
+        cipher: &Aes256Gcm,
+    ) -> Result<()> {
+        let records = {
+            let mut statement = transaction.prepare(
+                "SELECT namespace, reference, version, nonce, ciphertext FROM credentials",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok(EncryptedCredentialRecord {
+                        namespace: row.get(0)?,
+                        reference: row.get(1)?,
+                        version: row.get(2)?,
+                        nonce: row.get(3)?,
+                        ciphertext: row.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for record in records {
+            if record.version != SQLITE_ENCRYPTION_VERSION {
+                return Err(StoreError::Credential(format!(
+                    "unsupported credential encryption version {}",
+                    record.version
+                )));
+            }
+            let nonce: [u8; SQLITE_NONCE_BYTES] = record.nonce.try_into().map_err(|_| {
+                StoreError::Credential("stored credential nonce has an invalid length".into())
+            })?;
+            let associated_data = Self::associated_data_for(&record.namespace, &record.reference);
+            let _plaintext = Zeroizing::new(
+                cipher
+                    .decrypt(
+                        Nonce::from_slice(&nonce),
+                        Payload {
+                            msg: &record.ciphertext,
+                            aad: &associated_data,
+                        },
+                    )
+                    .map_err(|_| {
+                        StoreError::Credential(
+                            "credential key verification failed; the key or stored data is invalid"
+                                .into(),
+                        )
+                    })?,
+            );
+        }
+        Ok(())
+    }
+
+    fn insert_key_marker(transaction: &Transaction<'_>, cipher: &Aes256Gcm) -> Result<()> {
+        let mut nonce = [0_u8; SQLITE_NONCE_BYTES];
+        OsRng.fill_bytes(&mut nonce);
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: SQLITE_KEY_CHECK_PLAINTEXT,
+                    aad: SQLITE_KEY_CHECK_AAD,
+                },
+            )
+            .map_err(|_| {
+                StoreError::Credential("failed to initialize credential key check".into())
+            })?;
+        transaction.execute(
+            "INSERT INTO credential_store_metadata (name, version, nonce, ciphertext)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                SQLITE_KEY_CHECK_NAME,
+                SQLITE_ENCRYPTION_VERSION,
+                nonce.as_slice(),
+                ciphertext
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn cipher(&self) -> Aes256Gcm {
+        Self::cipher_for_key(self.key.as_ref().as_ref())
+    }
+
+    fn cipher_for_key(key: &[u8]) -> Aes256Gcm {
+        Aes256Gcm::new_from_slice(key)
+            .expect("a 32-byte credential key is always a valid AES-256 key")
+    }
+
+    fn associated_data(&self, reference: &str) -> Vec<u8> {
+        Self::associated_data_for(&self.namespace, reference)
+    }
+
+    fn associated_data_for(namespace: &str, reference: &str) -> Vec<u8> {
+        let namespace = namespace.as_bytes();
+        let reference = reference.as_bytes();
+        let mut value = Vec::with_capacity(40 + namespace.len() + reference.len());
+        value.extend_from_slice(b"sql-connector-credential");
+        value.extend_from_slice(&SQLITE_ENCRYPTION_VERSION.to_be_bytes());
+        value.extend_from_slice(&(namespace.len() as u64).to_be_bytes());
+        value.extend_from_slice(namespace);
+        value.extend_from_slice(reference);
+        value
+    }
+}
+
+impl CredentialStore for SqliteCredentialStore {
+    fn put(&self, reference: &str, secret: &SecretMaterial) -> Result<()> {
+        let encoded = Zeroizing::new(serde_json::to_vec(secret)?);
+        let mut nonce = [0_u8; SQLITE_NONCE_BYTES];
+        OsRng.fill_bytes(&mut nonce);
+        let associated_data = self.associated_data(reference);
+        let ciphertext = self
+            .cipher()
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: encoded.as_slice(),
+                    aad: &associated_data,
+                },
+            )
+            .map_err(|_| StoreError::Credential("failed to encrypt credential".into()))?;
+        self.connection
+            .lock()
+            .expect("credential database poisoned")
+            .execute(
+                "INSERT INTO credentials
+                    (namespace, reference, version, nonce, ciphertext, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)
+                 ON CONFLICT(namespace, reference) DO UPDATE SET
+                    version=excluded.version,
+                    nonce=excluded.nonce,
+                    ciphertext=excluded.ciphertext,
+                    updated_at=CURRENT_TIMESTAMP",
+                params![
+                    self.namespace,
+                    reference,
+                    SQLITE_ENCRYPTION_VERSION,
+                    nonce.as_slice(),
+                    ciphertext
+                ],
+            )?;
+        Ok(())
+    }
+
+    fn get(&self, reference: &str) -> Result<SecretMaterial> {
+        let stored: Option<(i64, Vec<u8>, Vec<u8>)> = self
+            .connection
+            .lock()
+            .expect("credential database poisoned")
+            .query_row(
+                "SELECT version, nonce, ciphertext FROM credentials
+                 WHERE namespace=?1 AND reference=?2",
+                params![self.namespace, reference],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let (version, nonce, ciphertext) = stored.ok_or(StoreError::NotFound)?;
+        if version != SQLITE_ENCRYPTION_VERSION {
+            return Err(StoreError::Credential(format!(
+                "unsupported credential encryption version {version}"
+            )));
+        }
+        let nonce: [u8; SQLITE_NONCE_BYTES] = nonce.try_into().map_err(|_| {
+            StoreError::Credential("stored credential nonce has an invalid length".into())
+        })?;
+        let associated_data = self.associated_data(reference);
+        let encoded = Zeroizing::new(
+            self.cipher()
+                .decrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: &ciphertext,
+                        aad: &associated_data,
+                    },
+                )
+                .map_err(|_| {
+                    StoreError::Credential(
+                        "credential decryption failed; the key or stored data is invalid".into(),
+                    )
+                })?,
+        );
+        Ok(serde_json::from_slice(&encoded)?)
+    }
+
+    fn delete(&self, reference: &str) -> Result<()> {
+        let affected = self
+            .connection
+            .lock()
+            .expect("credential database poisoned")
+            .execute(
+                "DELETE FROM credentials WHERE namespace=?1 AND reference=?2",
+                params![self.namespace, reference],
+            )?;
+        if affected == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]

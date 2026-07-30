@@ -11,10 +11,16 @@ does not define a public disclosure address.
 
 - Launch MCP over local stdio. Do not expose it as an unauthenticated TCP or
   HTTP service.
-- Restrict the data directory to the current OS user. It contains profiles and
-  audit metadata, though not credential values.
+- Restrict the data directory to the current OS user. It contains profiles,
+  audit metadata, and may contain encrypted credential payloads.
 - Store credentials only through the trusted control path. macOS Keychain and
-  Windows Credential Manager are the supported production backends.
+  Windows Credential Manager remain the default backend. The optional SQLite
+  backend encrypts every credential payload with AES-256-GCM and requires a
+  separate caller-managed 32-byte key file.
+- Restrict the SQLite key file to the current OS user and keep it separate from
+  database backups. SQLite encryption protects a database-only disclosure, not
+  an attacker who obtains both the database and key file. A lost key cannot be
+  recovered by the connector.
 - Use least-privilege database accounts and keep profile policies read-only
   until a specific workflow requires writes.
 - Protect the Agent's Ed25519 signing key separately from the MCP process. A

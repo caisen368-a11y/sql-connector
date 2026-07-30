@@ -7,7 +7,9 @@ mod profile;
 pub use audit::{
     AuditEvent, AuditQuery, AuditRepository, IdempotencyReservation, IdempotencyState,
 };
-pub use credential::{CredentialStore, InMemoryCredentialStore, OsCredentialStore};
+pub use credential::{
+    CredentialStore, InMemoryCredentialStore, OsCredentialStore, SqliteCredentialStore,
+};
 pub use profile::ProfileRepository;
 
 use thiserror::Error;

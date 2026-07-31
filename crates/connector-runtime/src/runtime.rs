@@ -32,6 +32,10 @@ use crate::{ConnectorRegistry, Result, RuntimeError};
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(1);
 const MASKED_CURSOR_TTL: Duration = Duration::from_secs(15 * 60);
 const MASKED_CURSOR_CAPACITY: usize = 1024;
+const DESCRIPTION_MAX_ROWS_WARNING: &str =
+    "entity fields were truncated by the connection max_rows limit";
+const DESCRIPTION_MAX_BYTES_WARNING: &str =
+    "entity fields were truncated by the connection max_bytes limit";
 
 #[derive(Debug, Clone)]
 pub struct ExecutionAuthorization {
@@ -567,6 +571,7 @@ impl Runtime {
             return Err(RuntimeError::Timeout);
         };
         let result = result.and_then(|mut description| {
+            filter_invisible_relationships(&profile.policy, &mut description);
             enforce_description_limits(&profile, &mut description)?;
             Ok(description)
         });
@@ -1472,18 +1477,30 @@ fn enforce_result_limits_and_masking(
         }
     }
 
-    while serde_json::to_vec(&result)?.len() as u64 > profile.policy.max_bytes {
-        if result.records.pop().is_none() {
-            return Err(RuntimeError::Connector(
-                connector_core::ConnectorError::new(
-                    ErrorCategory::InvalidRequest,
-                    "result metadata exceeds the connection byte limit",
-                ),
-            ));
+    loop {
+        result.metrics.returned = result.records.len() as u64;
+        if result.metrics.bytes.is_some() {
+            result.metrics.bytes = Some(serde_json::to_vec(&result.records)?.len() as u64);
         }
-        result.truncated = true;
+        if serde_json::to_vec(&result)?.len() as u64 <= profile.policy.max_bytes {
+            break;
+        }
+        let message = if result.next_cursor.is_some() {
+            "result exceeds the connection byte limit and cannot be safely truncated without invalidating its cursor"
+        } else if result.records.is_empty() {
+            "result metadata exceeds the connection byte limit"
+        } else if result.records.len() == 1 {
+            "first result row exceeds the connection byte limit"
+        } else {
+            result.records.pop();
+            result.truncated = true;
+            continue;
+        };
+        return Err(RuntimeError::Connector(
+            connector_core::ConnectorError::new(ErrorCategory::InvalidRequest, message)
+                .with_code("result_too_large"),
+        ));
     }
-    result.metrics.returned = result.records.len() as u64;
     Ok(())
 }
 
@@ -1548,7 +1565,13 @@ fn enforce_catalog_limits(
 }
 
 fn metadata_visible(policy: &connector_core::ConnectionPolicy, target: &str) -> bool {
-    if PolicyEngine::evaluate_metadata(policy, target) == PolicyDecision::Allow {
+    if !policy.enabled {
+        return false;
+    }
+    if let Some(rule) = PolicyEngine::matching_resource_rule(policy, target) {
+        return rule.allow_read;
+    }
+    if policy.resources.is_empty() {
         return true;
     }
     policy.resources.iter().any(|rule| {
@@ -1564,13 +1587,33 @@ fn metadata_visible(policy: &connector_core::ConnectionPolicy, target: &str) -> 
     })
 }
 
+fn filter_invisible_relationships(
+    policy: &connector_core::ConnectionPolicy,
+    description: &mut EntityDescription,
+) {
+    let Some(DbValue::Array(foreign_keys)) = description.metadata.get_mut("foreign_keys") else {
+        return;
+    };
+    foreign_keys.retain(|foreign_key| {
+        let DbValue::Document(foreign_key) = foreign_key else {
+            return false;
+        };
+        let Some(DbValue::String(referenced_entity)) = foreign_key.get("referenced_entity") else {
+            return false;
+        };
+        metadata_visible(policy, referenced_entity)
+    });
+}
+
 fn enforce_description_limits(
     profile: &connector_core::ConnectionProfile,
     description: &mut EntityDescription,
 ) -> std::result::Result<(), ConnectorError> {
-    description
-        .fields
-        .truncate(profile.policy.max_rows as usize);
+    let max_fields = profile.policy.max_rows as usize;
+    if description.fields.len() > max_fields {
+        description.fields.truncate(max_fields);
+        mark_description_truncated(description, DESCRIPTION_MAX_ROWS_WARNING);
+    }
     while serde_json::to_vec(&description)
         .map_err(|error| {
             ConnectorError::new(
@@ -1587,6 +1630,146 @@ fn enforce_description_limits(
                 "entity description metadata exceeds the connection byte limit",
             ));
         }
+        mark_description_truncated(description, DESCRIPTION_MAX_BYTES_WARNING);
     }
     Ok(())
+}
+
+fn mark_description_truncated(description: &mut EntityDescription, warning: &str) {
+    description.truncated = true;
+    if !description
+        .warnings
+        .iter()
+        .any(|existing| existing == warning)
+    {
+        description.warnings.push(warning.to_owned());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use connector_core::{
+        AuthKind, CatalogEntity, ConnectionPolicy, ConnectionProfile, DbRecord, Product,
+        ResultMetrics, TlsConfig, WriteOutcome,
+    };
+    use url::Url;
+
+    use super::*;
+
+    fn description(field_count: usize) -> EntityDescription {
+        EntityDescription {
+            entity: CatalogEntity {
+                id: "public.users".into(),
+                namespace: Some("public".into()),
+                name: "users".into(),
+                kind: "table".into(),
+                comment: None,
+            },
+            fields: (0..field_count)
+                .map(|index| {
+                    DbRecord::from([
+                        ("name".into(), DbValue::String(format!("field_{index}"))),
+                        ("comment".into(), DbValue::String("x".repeat(256))),
+                    ])
+                })
+                .collect(),
+            metadata: DbRecord::new(),
+            truncated: false,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn profile(max_rows: u32, max_bytes: u64) -> ConnectionProfile {
+        ConnectionProfile {
+            id: ConnectionId::new(),
+            display_name: "test".into(),
+            product: Product::PostgreSql,
+            api_mode: "postgresql".into(),
+            endpoint: Url::parse("postgresql://localhost:5432").unwrap(),
+            database: None,
+            tags: Vec::new(),
+            auth_kind: AuthKind::UsernamePassword,
+            secret_ref: "secret".into(),
+            tls: TlsConfig::default(),
+            policy: ConnectionPolicy {
+                max_rows,
+                max_bytes,
+                ..ConnectionPolicy::default()
+            },
+            policy_version: 1,
+            expected_version: None,
+            options: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn description_row_truncation_is_reported_without_duplicate_warnings() {
+        let mut description = description(3);
+        description
+            .warnings
+            .push(DESCRIPTION_MAX_ROWS_WARNING.into());
+
+        enforce_description_limits(&profile(1, u64::MAX), &mut description).unwrap();
+
+        assert_eq!(description.fields.len(), 1);
+        assert!(description.truncated);
+        assert_eq!(
+            description
+                .warnings
+                .iter()
+                .filter(|warning| warning.as_str() == DESCRIPTION_MAX_ROWS_WARNING)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn description_byte_truncation_is_reported_and_respects_the_limit() {
+        let mut description = description(3);
+        let mut expected = description.clone();
+        expected.fields.pop();
+        mark_description_truncated(&mut expected, DESCRIPTION_MAX_BYTES_WARNING);
+        let max_bytes = serde_json::to_vec(&expected).unwrap().len() as u64;
+        assert!(serde_json::to_vec(&description).unwrap().len() as u64 > max_bytes);
+
+        enforce_description_limits(&profile(u32::MAX, max_bytes), &mut description).unwrap();
+
+        assert_eq!(description, expected);
+        assert!(serde_json::to_vec(&description).unwrap().len() as u64 <= max_bytes);
+    }
+
+    #[test]
+    fn byte_guard_rejects_paged_results_without_mutating_the_opaque_cursor() {
+        let records = vec![
+            DbRecord::from([("id".into(), DbValue::Int64(1))]),
+            DbRecord::from([("id".into(), DbValue::Int64(2))]),
+        ];
+        let mut result = OperationResult {
+            request_id: "paged-result".into(),
+            records: records.clone(),
+            next_cursor: Some("connector-owned-cursor".into()),
+            truncated: true,
+            warnings: Vec::new(),
+            metrics: ResultMetrics {
+                returned: records.len() as u64,
+                bytes: Some(serde_json::to_vec(&records).unwrap().len() as u64),
+                ..ResultMetrics::default()
+            },
+            outcome: WriteOutcome::NotApplicable,
+        };
+        let original = result.clone();
+        let max_bytes = serde_json::to_vec(&result).unwrap().len() as u64 - 1;
+
+        let error = enforce_result_limits_and_masking(&profile(10, max_bytes), None, &mut result)
+            .unwrap_err();
+
+        let RuntimeError::Connector(error) = error else {
+            panic!("byte guard must return a connector error");
+        };
+        assert_eq!(error.category, ErrorCategory::InvalidRequest);
+        assert_eq!(error.code.as_deref(), Some("result_too_large"));
+        assert_eq!(result, original);
+    }
 }

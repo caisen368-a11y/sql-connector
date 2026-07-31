@@ -398,6 +398,8 @@ fn metric_description(
         },
         fields,
         metadata,
+        truncated: false,
+        warnings: Vec::new(),
     })
 }
 

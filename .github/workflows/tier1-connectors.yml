@@ -1,0 +1,358 @@
+name: Tier 1 connectors
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/tier1-connectors.yml
+      - apps/sql-connector/**
+      - crates/**
+      - scripts/tier1/**
+      - docs/connector-certification.json
+      - Cargo.toml
+      - Cargo.lock
+  workflow_call:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: Validate Tier 1 contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install 1.96.1 --profile minimal
+
+      - name: Validate certification ledger
+        run: cargo +1.96.1 test --locked -p sql-connector --test certification
+
+      - name: Validate SQL byte and cursor limits
+        run: >-
+          cargo +1.96.1 test --locked -p connectors-sql --lib
+          common::tests::
+
+      - name: Validate Runtime cursor protection
+        run: >-
+          cargo +1.96.1 test --locked -p connector-runtime --lib
+          byte_guard_rejects_paged_results_without_mutating_the_opaque_cursor
+
+  matrix:
+    name: Build Tier 1 matrix
+    runs-on: ubuntu-24.04
+    outputs:
+      value: ${{ steps.matrix.outputs.value }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Generate matrix from certification ledger
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          value="$(jq --compact-output '
+            {include: [
+              .tier1[] as $connector
+              | $connector.platforms[] as $runner
+              | $connector.server_versions[] as $version
+              | {
+                  label: ($connector.manifest_id + " " + $version + " / " + $runner),
+                  runner: $runner,
+                  engine: (
+                    if $connector.manifest_id == "mysql-protocol"
+                    then "mysql"
+                    else "postgres"
+                    end
+                  ),
+                  version: $version
+                }
+            ]}
+          ' docs/connector-certification.json)"
+          printf 'value=%s\n' "$value" >> "$GITHUB_OUTPUT"
+
+  live:
+    name: ${{ matrix.label }}
+    needs: [contract, matrix]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.value) }}
+
+    env:
+      TIER1_DATABASE: connector_e2e
+      TIER1_USERNAME: connector
+      TIER1_PASSWORD: connector-ci-password
+      TIER1_MYSQL_ROOT_PASSWORD: root-ci-password
+      TIER1_POSTGRES_PORT: "55432"
+      TIER1_MYSQL_PORT: "53306"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install 1.96.1 --profile minimal
+
+      - name: Set up PostgreSQL
+        if: matrix.engine == 'postgres'
+        id: postgres
+        uses: ikalnytskyi/action-setup-postgres@c4dda34aae1c821e3a771b68b73b13af3198a7ee # v8
+        with:
+          postgres-version: ${{ matrix.version }}
+          username: ${{ env.TIER1_USERNAME }}
+          password: ${{ env.TIER1_PASSWORD }}
+          database: ${{ env.TIER1_DATABASE }}
+          port: ${{ env.TIER1_POSTGRES_PORT }}
+          ssl: true
+
+      - name: Require PostgreSQL TLS
+        if: matrix.engine == 'postgres'
+        shell: bash
+        env:
+          PGDATA: ${{ runner.temp }}/pgdata
+          PGSERVICE: connector
+        run: |
+          set -euo pipefail
+          export MSYS2_ARG_CONV_EXCL="/CN"
+
+          openssl req -new -x509 -newkey rsa:2048 -nodes -days 1 -sha256 \
+            -subj "/CN=SQL-Connector-Tier1-CA" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign" \
+            -keyout "$PGDATA/ca.key" \
+            -out "$PGDATA/ca.crt"
+          openssl req -new -newkey rsa:2048 -nodes -sha256 \
+            -subj "/CN=localhost" \
+            -addext "basicConstraints=critical,CA:FALSE" \
+            -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+            -addext "extendedKeyUsage=serverAuth" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+            -keyout "$PGDATA/server.key" \
+            -out "$PGDATA/server.csr"
+          openssl x509 -req -days 1 -sha256 \
+            -in "$PGDATA/server.csr" \
+            -CA "$PGDATA/ca.crt" \
+            -CAkey "$PGDATA/ca.key" \
+            -CAcreateserial \
+            -copy_extensions copy \
+            -out "$PGDATA/server.crt"
+          chmod og-rwx \
+            "$PGDATA/ca.key" \
+            "$PGDATA/ca.crt" \
+            "$PGDATA/server.key" \
+            "$PGDATA/server.crt"
+          openssl verify -CAfile "$PGDATA/ca.crt" \
+            -purpose sslserver -verify_hostname localhost "$PGDATA/server.crt"
+          openssl verify -CAfile "$PGDATA/ca.crt" \
+            -purpose sslserver -verify_ip 127.0.0.1 "$PGDATA/server.crt"
+
+          service_tmp="$PGDATA/pg_service.conf.tls"
+          while IFS= read -r line; do
+            case "$line" in
+              sslrootcert=*) printf 'sslrootcert=%s/ca.crt\n' "$PGDATA" ;;
+              *) printf '%s\n' "$line" ;;
+            esac
+          done < "$PGDATA/pg_service.conf" > "$service_tmp"
+          mv "$service_tmp" "$PGDATA/pg_service.conf"
+
+          hba_tmp="$PGDATA/pg_hba.conf.tls"
+          {
+            printf '%s\n' \
+              'hostnossl all all 0.0.0.0/0 reject' \
+              'hostnossl all all ::0/0 reject'
+            cat "$PGDATA/pg_hba.conf"
+          } > "$hba_tmp"
+          mv "$hba_tmp" "$PGDATA/pg_hba.conf"
+          pg_ctl restart --pgdata="$PGDATA" --wait --timeout=60
+
+      - name: Set up MySQL
+        if: matrix.engine == 'mysql'
+        id: mysql
+        uses: shogo82148/actions-setup-mysql@3dcedf762c5e82d781a9e414462785b30208e79c # v1.53.0
+        with:
+          mysql-version: ${{ matrix.version }}
+          root-password: ${{ env.TIER1_MYSQL_ROOT_PASSWORD }}
+          user: ${{ env.TIER1_USERNAME }}
+          password: ${{ env.TIER1_PASSWORD }}
+          my-cnf: |
+            port=${{ env.TIER1_MYSQL_PORT }}
+            bind-address=127.0.0.1
+            mysqlx=0
+
+      - name: Require MySQL TLS
+        if: matrix.engine == 'mysql'
+        shell: bash
+        env:
+          MYSQL_PWD: ${{ env.TIER1_MYSQL_ROOT_PASSWORD }}
+          MYSQL_BASE_DIR: ${{ steps.mysql.outputs.base-dir }}
+        run: |
+          set -euo pipefail
+          ca_file="$MYSQL_BASE_DIR/var/ca.pem"
+          test -s "$ca_file"
+
+          mysql --protocol=TCP --host=127.0.0.1 --port="$TIER1_MYSQL_PORT" \
+            --user=root --ssl-mode=VERIFY_IDENTITY --ssl-ca="$ca_file" \
+            --execute="SET GLOBAL require_secure_transport = ON"
+
+          if mysql --protocol=TCP --host=127.0.0.1 --port="$TIER1_MYSQL_PORT" \
+            --user=root --ssl-mode=DISABLED --execute="SELECT 1" >/dev/null 2>&1; then
+            echo "MySQL accepted a non-TLS TCP connection" >&2
+            exit 1
+          fi
+
+      - name: Check PostgreSQL health and TLS
+        if: matrix.engine == 'postgres'
+        shell: bash
+        env:
+          PGSERVICE: connector
+        run: |
+          set -euo pipefail
+          ready=false
+          for attempt in $(seq 1 60); do
+            if pg_isready --dbname=service=connector >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$ready" != true ]]; then
+            echo "PostgreSQL did not become ready" >&2
+            exit 1
+          fi
+
+          version="$(psql --no-psqlrc --tuples-only --no-align \
+            --command='SHOW server_version')"
+          tls="$(psql --no-psqlrc --tuples-only --no-align \
+            --command='SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()')"
+          [[ "$version" == "${{ matrix.version }}."* ]]
+          [[ "$tls" == "t" ]]
+
+          if PGPASSWORD="$TIER1_PASSWORD" psql --no-psqlrc \
+            --dbname="host=127.0.0.1 port=$TIER1_POSTGRES_PORT user=$TIER1_USERNAME dbname=$TIER1_DATABASE sslmode=disable" \
+            --command='SELECT 1' >/dev/null 2>&1; then
+            echo "PostgreSQL accepted a non-TLS TCP connection" >&2
+            exit 1
+          fi
+
+      - name: Check MySQL health and TLS
+        if: matrix.engine == 'mysql'
+        shell: bash
+        env:
+          MYSQL_PWD: ${{ env.TIER1_MYSQL_ROOT_PASSWORD }}
+          MYSQL_BASE_DIR: ${{ steps.mysql.outputs.base-dir }}
+        run: |
+          set -euo pipefail
+          ca_file="$MYSQL_BASE_DIR/var/ca.pem"
+          ready=false
+          for attempt in $(seq 1 60); do
+            if mysqladmin --protocol=TCP --host=127.0.0.1 --port="$TIER1_MYSQL_PORT" \
+              --user=root --ssl-mode=VERIFY_IDENTITY --ssl-ca="$ca_file" \
+              ping --silent >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$ready" != true ]]; then
+            echo "MySQL did not become ready" >&2
+            exit 1
+          fi
+
+          version="$(mysql --protocol=TCP --host=127.0.0.1 --port="$TIER1_MYSQL_PORT" \
+            --user=root --ssl-mode=VERIFY_IDENTITY --ssl-ca="$ca_file" \
+            --skip-column-names --batch --execute='SELECT VERSION()')"
+          cipher="$(mysql --protocol=TCP --host=127.0.0.1 --port="$TIER1_MYSQL_PORT" \
+            --user=root --ssl-mode=VERIFY_IDENTITY --ssl-ca="$ca_file" \
+            --skip-column-names --batch \
+            --execute="SHOW SESSION STATUS LIKE 'Ssl_cipher'" | awk '{print $2}')"
+          [[ "$version" == "${{ matrix.version }}."* ]]
+          [[ -n "$cipher" ]]
+
+      - name: Initialize PostgreSQL fixture
+        if: matrix.engine == 'postgres'
+        shell: bash
+        env:
+          PGSERVICE: connector
+        run: psql --no-psqlrc --set=ON_ERROR_STOP=1 --file=scripts/tier1/postgres.sql
+
+      - name: Initialize MySQL fixture
+        if: matrix.engine == 'mysql'
+        shell: bash
+        env:
+          MYSQL_PWD: ${{ env.TIER1_MYSQL_ROOT_PASSWORD }}
+          MYSQL_BASE_DIR: ${{ steps.mysql.outputs.base-dir }}
+        run: |
+          set -euo pipefail
+          mysql --protocol=TCP --host=127.0.0.1 --port="$TIER1_MYSQL_PORT" \
+            --user=root --ssl-mode=VERIFY_IDENTITY \
+            --ssl-ca="$MYSQL_BASE_DIR/var/ca.pem" < scripts/tier1/mysql.sql
+
+      - name: Build SQL Connector worker
+        shell: bash
+        run: cargo +1.96.1 build --locked -p sql-connector
+
+      - name: Export absolute worker path
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            test -f target/debug/sql-connector.exe
+            worker_path="$(pwd -W)\\target\\debug\\sql-connector.exe"
+          else
+            test -x target/debug/sql-connector
+            worker_path="$(pwd -P)/target/debug/sql-connector"
+          fi
+
+          case "${{ matrix.engine }}" in
+            postgres)
+              printf 'SQL_CONNECTOR_POSTGRES_E2E_WORKER=%s\n' "$worker_path" >> "$GITHUB_ENV"
+              ;;
+            mysql)
+              printf 'SQL_CONNECTOR_MYSQL_E2E_WORKER=%s\n' "$worker_path" >> "$GITHUB_ENV"
+              ;;
+          esac
+
+      - name: Run exact PostgreSQL MCP live test
+        if: matrix.engine == 'postgres'
+        shell: bash
+        env:
+          SQL_CONNECTOR_POSTGRES_E2E_ENDPOINT: postgresql://localhost:55432
+          SQL_CONNECTOR_POSTGRES_E2E_DATABASE: ${{ env.TIER1_DATABASE }}
+          SQL_CONNECTOR_POSTGRES_E2E_USERNAME: ${{ env.TIER1_USERNAME }}
+          SQL_CONNECTOR_POSTGRES_E2E_PASSWORD: ${{ env.TIER1_PASSWORD }}
+          SQL_CONNECTOR_POSTGRES_E2E_CA_CERTIFICATE_FILE: ${{ runner.temp }}/pgdata/ca.crt
+          SQL_CONNECTOR_POSTGRES_E2E_TLS_SERVER_NAME: localhost
+          SQL_CONNECTOR_POSTGRES_E2E_EXPECTED_VERSION_PREFIX: PostgreSQL ${{ matrix.version }}.
+        run: >-
+          cargo +1.96.1 test --locked -p connector-mcp
+          --test postgres_live
+          postgres_connection_is_identified_and_crud_is_policy_controlled_over_mcp
+          -- --exact --ignored --nocapture
+
+      - name: Run exact MySQL MCP live test
+        if: matrix.engine == 'mysql'
+        shell: bash
+        env:
+          SQL_CONNECTOR_MYSQL_E2E_ENDPOINT: mysql://127.0.0.1:53306
+          SQL_CONNECTOR_MYSQL_E2E_DATABASE: ${{ env.TIER1_DATABASE }}
+          SQL_CONNECTOR_MYSQL_E2E_USERNAME: ${{ env.TIER1_USERNAME }}
+          SQL_CONNECTOR_MYSQL_E2E_PASSWORD: ${{ env.TIER1_PASSWORD }}
+          SQL_CONNECTOR_MYSQL_E2E_CA_CERTIFICATE_FILE: ${{ steps.mysql.outputs.base-dir }}/var/ca.pem
+          SQL_CONNECTOR_MYSQL_E2E_TLS_SERVER_NAME: "127.0.0.1"
+          SQL_CONNECTOR_MYSQL_E2E_EXPECTED_VERSION_PREFIX: ${{ matrix.version }}.
+        run: >-
+          cargo +1.96.1 test --locked -p connector-mcp
+          --test mysql_live
+          mysql_binary_parameters_and_bounded_writes_work_over_mcp
+          -- --exact --ignored --nocapture

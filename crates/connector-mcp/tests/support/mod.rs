@@ -87,3 +87,73 @@ pub fn success(result: CallToolResult) -> Value {
         .structured_content
         .expect("successful database tools return structured content")
 }
+
+pub fn assert_items_schema(inspection: &Value, target: &str, owners_target: &str) {
+    assert!(inspection["warnings"].as_array().unwrap().is_empty());
+    let description = inspection["descriptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|description| description["entity"]["id"] == target)
+        .expect("schema inspection must describe the items table");
+    assert_eq!(description["truncated"], false);
+    assert!(description["warnings"].as_array().unwrap().is_empty());
+    assert!(
+        description["entity"]["comment"]
+            .as_str()
+            .is_some_and(|comment| !comment.is_empty())
+    );
+
+    let fields = description["fields"].as_array().unwrap();
+    for expected in ["id", "owner_id", "name", "qty", "metadata", "payload"] {
+        assert!(
+            fields
+                .iter()
+                .any(|field| field["name"]["value"] == expected),
+            "schema inspection omitted field {expected}"
+        );
+    }
+    let id = fields
+        .iter()
+        .find(|field| field["name"]["value"] == "id")
+        .unwrap();
+    assert!(
+        id["comment"]["value"]
+            .as_str()
+            .is_some_and(|comment| !comment.is_empty())
+    );
+
+    let metadata = &description["metadata"];
+    assert_eq!(
+        metadata["primary_key"]["value"]["columns"]["value"][0]["value"],
+        "id"
+    );
+    let foreign_key = metadata["foreign_keys"]["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|key| key["value"]["columns"]["value"][0]["value"] == "owner_id")
+        .expect("schema inspection must expose the owner foreign key");
+    assert_eq!(
+        foreign_key["value"]["referenced_entity"]["value"],
+        owners_target
+    );
+    assert_eq!(
+        foreign_key["value"]["referenced_columns"]["value"][0]["value"],
+        "id"
+    );
+    assert!(
+        metadata["unique_constraints"]["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|constraint| constraint["value"]["columns"]["value"][0]["value"] == "name")
+    );
+    let qty_index = metadata["indexes"]["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|index| index["value"]["columns"]["value"][0]["value"] == "qty")
+        .expect("schema inspection must expose the qty index");
+    assert_eq!(qty_index["value"]["unique"]["value"], false);
+}

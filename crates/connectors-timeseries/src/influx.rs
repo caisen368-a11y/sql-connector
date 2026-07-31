@@ -316,6 +316,8 @@ impl InfluxConnector {
                     DbValue::String(namespace.to_owned()),
                 ),
             ]),
+            truncated: false,
+            warnings: Vec::new(),
         })
     }
 

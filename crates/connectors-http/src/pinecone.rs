@@ -211,6 +211,8 @@ impl PineconeConnector {
                 ),
             ])],
             metadata,
+            truncated: false,
+            warnings: Vec::new(),
         })
     }
 

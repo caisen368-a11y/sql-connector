@@ -256,6 +256,8 @@ impl SplunkConnector {
             },
             fields: Vec::new(),
             metadata,
+            truncated: false,
+            warnings: Vec::new(),
         })
     }
 

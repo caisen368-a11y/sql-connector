@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "tier1": [
+    {
+      "manifest_id": "mysql-protocol",
+      "server_versions": ["8.0", "8.4"],
+      "platforms": ["macos-15-intel", "macos-15", "windows-2022"],
+      "requirements": [
+        "test_connection",
+        "db_inspect_schema",
+        "bounded_reads",
+        "tls_server_verification",
+        "cancellation",
+        "worker_restart"
+      ],
+      "workflow": ".github/workflows/tier1-connectors.yml"
+    },
+    {
+      "manifest_id": "postgresql-pgwire",
+      "server_versions": ["14", "18"],
+      "platforms": ["macos-15-intel", "macos-15", "windows-2022"],
+      "requirements": [
+        "test_connection",
+        "db_inspect_schema",
+        "bounded_reads",
+        "tls_server_verification",
+        "cancellation",
+        "worker_restart"
+      ],
+      "workflow": ".github/workflows/tier1-connectors.yml"
+    }
+  ],
+  "verified": []
+}

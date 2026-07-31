@@ -213,6 +213,13 @@ fn mcp_tool_routes(
     ] {
         add_tool_route(&mut routes, manifest, capability, tool);
     }
+    if manifest.supports(Capability::Discover) && manifest.supports(Capability::Describe) {
+        routes.push(McpToolRoute {
+            capability: Capability::Describe,
+            tool: "db_inspect_schema".to_owned(),
+            fixed_policy_target: None,
+        });
+    }
 
     let tools = match target_kind {
         ResourceTargetKind::SqlRelation => ("sql_read", "sql_insert", "sql_update", "sql_delete"),

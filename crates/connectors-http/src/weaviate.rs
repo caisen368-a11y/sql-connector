@@ -169,6 +169,8 @@ impl WeaviateConnector {
             },
             fields,
             metadata,
+            truncated: false,
+            warnings: Vec::new(),
         })
     }
 

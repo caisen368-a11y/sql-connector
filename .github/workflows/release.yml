@@ -10,8 +10,13 @@ permissions:
   contents: write
 
 jobs:
+  tier1-connectors:
+    name: Certify Tier 1 connectors
+    uses: ./.github/workflows/tier1-connectors.yml
+
   build:
     name: Build ${{ matrix.package }}
+    needs: tier1-connectors
     strategy:
       fail-fast: false
       matrix:

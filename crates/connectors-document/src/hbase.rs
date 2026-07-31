@@ -942,6 +942,8 @@ fn describe_table(descriptor: TTableDescriptor) -> Result<EntityDescription> {
             ("table".into(), DbValue::String(qualifier)),
             ("row_key_field".into(), DbValue::String(ROW_KEY.into())),
         ]),
+        truncated: false,
+        warnings: Vec::new(),
     })
 }
 

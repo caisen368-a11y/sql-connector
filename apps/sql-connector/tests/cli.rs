@@ -9,7 +9,7 @@ use std::{
 
 use connector_core::{
     AuthKind, Capability, ConnectionId, ConnectionPolicy, ConnectionProfile, ConnectorManifest,
-    ConnectorStatus, Product, TlsConfig,
+    Product, TlsConfig,
 };
 use connector_ipc::{ConnectorCall, ConnectorReply, WorkerClient, WorkerSupervisor};
 use connector_store::ProfileRepository;
@@ -75,10 +75,11 @@ fn manifests_command_writes_json_to_stdout() {
     .into_iter()
     .collect();
     assert_eq!(products, expected);
-    assert!(manifests.iter().all(|manifest| {
-        manifest.status != ConnectorStatus::Verified
-            && (!manifest.capabilities.is_empty() || !manifest.limitations.is_empty())
-    }));
+    assert!(
+        manifests
+            .iter()
+            .all(|manifest| !manifest.capabilities.is_empty() || !manifest.limitations.is_empty())
+    );
     let couchbase = manifests
         .iter()
         .find(|manifest| manifest.product == Product::Couchbase)

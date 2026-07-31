@@ -196,6 +196,8 @@ impl QdrantRestConnector {
                         .map_or(DbValue::Null, json_to_db_value),
                 ),
             ]),
+            truncated: false,
+            warnings: Vec::new(),
         })
     }
 

@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use connector_core::{
-    AuthKind, ConnectionId, ConnectionPolicy, ConnectionProfile, DataEgress, DbValue, Product,
+    AuthKind, Capability, CatalogEntity, ConnectionId, ConnectionPolicy, ConnectionProfile,
+    ConnectorManifest, ConnectorStatus, DataEgress, DbValue, EntityDescription, Product,
     SanitizedConnection, SecretMaterial, TlsConfig,
 };
 use url::Url;
@@ -55,6 +56,25 @@ fn legacy_profiles_default_to_policy_version_one() {
     let profile: ConnectionProfile = serde_json::from_value(encoded).unwrap();
     assert_eq!(profile.policy_version, 1);
     assert!(profile.policy.enabled);
+}
+
+#[test]
+fn legacy_entity_descriptions_default_to_complete_without_warnings() {
+    let description: EntityDescription = serde_json::from_value(serde_json::json!({
+        "entity": CatalogEntity {
+            id: "public.users".into(),
+            namespace: Some("public".into()),
+            name: "users".into(),
+            kind: "table".into(),
+            comment: None,
+        },
+        "fields": [],
+        "metadata": {}
+    }))
+    .unwrap();
+
+    assert!(!description.truncated);
+    assert!(description.warnings.is_empty());
 }
 
 #[test]
@@ -115,4 +135,39 @@ fn native_request_accepts_positional_parameters_without_placeholder_rewriting() 
     };
     assert_eq!(request.statement, "select $1::bigint");
     assert_eq!(request.positional_parameters, vec![DbValue::Int64(7)]);
+}
+
+#[test]
+fn schema_inspection_route_requires_discover_and_describe() {
+    let descriptor = |capabilities| {
+        ConnectorManifest {
+            id: "test-mysql".into(),
+            display_name: "Test MySQL".into(),
+            product: Product::MySql,
+            api_mode: "mysql".into(),
+            driver: "test".into(),
+            driver_version: "1".into(),
+            status: ConnectorStatus::Experimental,
+            capabilities,
+            auth_kinds: vec![AuthKind::UsernamePassword],
+            limitations: vec![],
+        }
+        .into_descriptor()
+    };
+
+    let complete = descriptor(vec![Capability::Discover, Capability::Describe]);
+    assert!(
+        complete
+            .mcp_tools
+            .iter()
+            .any(|route| route.tool == "db_inspect_schema")
+    );
+
+    let discover_only = descriptor(vec![Capability::Discover]);
+    assert!(
+        discover_only
+            .mcp_tools
+            .iter()
+            .all(|route| route.tool != "db_inspect_schema")
+    );
 }

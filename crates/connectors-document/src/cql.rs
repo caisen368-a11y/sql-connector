@@ -608,6 +608,8 @@ impl Connector for CqlConnector {
                 },
                 fields,
                 metadata: BTreeMap::new(),
+                truncated: false,
+                warnings: Vec::new(),
             })
         }))
         .await

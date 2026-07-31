@@ -3,8 +3,8 @@ use std::{ops::ControlFlow, time::Duration};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use connector_core::{
     CatalogEntity, CatalogPage, CatalogQuery, ConnectionProfile, ConnectorContext, ConnectorError,
-    DbRecord, DbValue, DeleteRequest, ErrorCategory, Filter, InsertRequest, QueryOptions,
-    ReadRequest, Result, SortDirection, UpdateRequest,
+    DbRecord, DbValue, DeleteRequest, ErrorCategory, Filter, InsertRequest, OperationResult,
+    QueryOptions, ReadRequest, Result, SortDirection, UpdateRequest,
 };
 use serde::{Deserialize, Serialize};
 use sqlparser::{
@@ -618,27 +618,49 @@ pub(crate) fn json_to_record(value: serde_json::Value) -> Result<DbRecord> {
 }
 
 pub(crate) fn truncate_records(
-    records: &mut Vec<DbRecord>,
+    result: &mut OperationResult,
     row_limit: usize,
     max_bytes: u64,
-) -> Result<bool> {
-    let mut truncated = records.len() > row_limit;
-    records.truncate(row_limit);
-    let mut used = 0_u64;
-    let mut keep = records.len();
-    for (index, record) in records.iter().enumerate() {
-        let size = serde_json::to_vec(record)
-            .map_err(|error| invalid(format!("could not serialize result row: {error}")))?
-            .len() as u64;
-        if used.saturating_add(size) > max_bytes {
-            keep = index;
-            truncated = true;
-            break;
+    source_truncated: bool,
+    base_offset: Option<u64>,
+) -> Result<()> {
+    let original_count = result.records.len();
+    result.records.truncate(row_limit);
+    let mut truncated = source_truncated || result.records.len() < original_count;
+
+    loop {
+        result.truncated = truncated;
+        result.next_cursor = if truncated {
+            base_offset
+                .map(|offset| offset.saturating_add(result.records.len() as u64))
+                .map(encode_offset)
+                .transpose()?
+        } else {
+            None
+        };
+        result.metrics.returned = result.records.len() as u64;
+        result.metrics.bytes = Some(
+            serde_json::to_vec(&result.records)
+                .map_err(|error| invalid(format!("could not serialize result rows: {error}")))?
+                .len() as u64,
+        );
+
+        let serialized = serde_json::to_vec(result)
+            .map_err(|error| invalid(format!("could not serialize result: {error}")))?;
+        if serialized.len() as u64 <= max_bytes {
+            return Ok(());
         }
-        used = used.saturating_add(size);
+        if result.records.len() <= 1 {
+            let message = if result.records.is_empty() {
+                "result metadata exceeds the connection byte limit"
+            } else {
+                "first result row exceeds the connection byte limit"
+            };
+            return Err(invalid(message).with_code("result_too_large"));
+        }
+        result.records.pop();
+        truncated = true;
     }
-    records.truncate(keep);
-    Ok(truncated)
 }
 
 #[cfg(test)]
@@ -646,7 +668,8 @@ mod tests {
     use std::{collections::BTreeMap, time::Instant};
 
     use connector_core::{
-        AuthKind, ConnectionId, ConnectionPolicy, DataEgress, Product, TlsConfig,
+        AuthKind, ConnectionId, ConnectionPolicy, DataEgress, Product, ResultMetrics, TlsConfig,
+        WriteOutcome,
     };
     use url::Url;
 
@@ -832,5 +855,56 @@ mod tests {
         assert!(pg.sql.contains("LIMIT 5"));
         assert!(mysql.sql.ends_with("LIMIT 5"));
         assert!(tds.sql.contains("TOP (5)"));
+    }
+
+    fn operation_result(records: Vec<DbRecord>) -> OperationResult {
+        let bytes = serde_json::to_vec(&records).unwrap().len() as u64;
+        OperationResult {
+            request_id: "bounded-read".into(),
+            metrics: ResultMetrics {
+                returned: records.len() as u64,
+                bytes: Some(bytes),
+                ..ResultMetrics::default()
+            },
+            records,
+            next_cursor: None,
+            truncated: false,
+            warnings: Vec::new(),
+            outcome: WriteOutcome::NotApplicable,
+        }
+    }
+
+    #[test]
+    fn complete_result_limit_rejects_a_first_row_that_cannot_fit() {
+        let records = vec![DbRecord::from([(
+            "value".into(),
+            DbValue::String("small row".into()),
+        )])];
+        let records_bytes = serde_json::to_vec(&records).unwrap().len() as u64;
+        let mut result = operation_result(records);
+        assert!(serde_json::to_vec(&result).unwrap().len() as u64 > records_bytes);
+
+        let error = truncate_records(&mut result, 10, records_bytes, false, Some(0)).unwrap_err();
+
+        assert_eq!(error.category, ErrorCategory::InvalidRequest);
+        assert_eq!(error.code.as_deref(), Some("result_too_large"));
+        assert!(error.message.contains("first result row"));
+    }
+
+    #[test]
+    fn byte_truncation_builds_cursor_from_the_final_record_count() {
+        let first = DbRecord::from([("value".into(), DbValue::String("first".into()))]);
+        let second = DbRecord::from([("value".into(), DbValue::String("x".repeat(4 * 1024)))]);
+        let mut result = operation_result(vec![first.clone(), second]);
+        let input_cursor = encode_offset(7).unwrap();
+
+        truncate_records(&mut result, 10, 1024, false, Some(7)).unwrap();
+
+        assert_eq!(result.records, vec![first]);
+        assert!(result.truncated);
+        assert_eq!(result.metrics.returned, 1);
+        assert_eq!(decode_offset(result.next_cursor.as_deref()).unwrap(), 8);
+        assert_ne!(result.next_cursor.as_deref(), Some(input_cursor.as_str()));
+        assert!(serde_json::to_vec(&result).unwrap().len() <= 1024);
     }
 }

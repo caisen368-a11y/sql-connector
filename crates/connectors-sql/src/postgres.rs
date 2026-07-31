@@ -33,9 +33,10 @@ use crate::{
     common::{
         BuiltQuery, SqlFamily, build_delete, build_insert, build_read, build_update,
         catalog_fetch_inputs, catalog_page, decode_offset, effective_row_limit, effective_timeout,
-        effective_write_limit, encode_offset, invalid, json_to_record, parse_native,
-        required_secret, truncate_records, unsupported, validate_auth, validate_tls,
+        effective_write_limit, invalid, json_to_record, parse_native, required_secret,
+        truncate_records, unsupported, validate_auth, validate_tls,
     },
+    relational_metadata::{ForeignKeyMetadata, IndexMetadata, NamedColumns, RelationalMetadata},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,10 +354,13 @@ impl Connector for PostgresConnector {
                 let pattern = query.pattern.as_deref().map(|value| format!("%{value}%"));
                 let rows = client
                     .query(
-                        "SELECT table_schema, table_name, table_type FROM information_schema.tables \
-                         WHERE ($1::text IS NULL OR table_schema = $1) \
-                         AND ($2::text IS NULL OR table_name ILIKE $2) \
-                         ORDER BY table_schema, table_name LIMIT $3 OFFSET $4",
+                        "SELECT t.table_schema, t.table_name, t.table_type FROM information_schema.tables AS t \
+                         WHERE ($1::text IS NULL OR t.table_schema = $1) \
+                         AND ($2::text IS NULL OR t.table_name ILIKE $2 \
+                              OR EXISTS (SELECT 1 FROM information_schema.columns AS c \
+                                         WHERE c.table_schema = t.table_schema \
+                                         AND c.table_name = t.table_name AND c.column_name ILIKE $2)) \
+                         ORDER BY t.table_schema, t.table_name LIMIT $3 OFFSET $4",
                         &[
                             &query.namespace,
                             &pattern,
@@ -423,9 +427,26 @@ impl Connector for PostgresConnector {
                 let client = connect(&pools, &profile, &secret, timeout).await?;
                 let rows = client
                     .query(
-                        "SELECT column_name, data_type, is_nullable, ordinal_position::bigint \
-                         FROM information_schema.columns \
-                         WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
+                        "SELECT c.column_name, c.data_type, c.is_nullable, \
+                                c.ordinal_position::bigint, column_comment.description, \
+                                table_comment.description, t.table_type \
+                         FROM information_schema.columns AS c \
+                         JOIN information_schema.tables AS t \
+                           ON t.table_schema = c.table_schema AND t.table_name = c.table_name \
+                         LEFT JOIN pg_catalog.pg_namespace AS namespace \
+                           ON namespace.nspname = c.table_schema \
+                         LEFT JOIN pg_catalog.pg_class AS relation \
+                           ON relation.relnamespace = namespace.oid AND relation.relname = c.table_name \
+                         LEFT JOIN pg_catalog.pg_description AS column_comment \
+                           ON column_comment.objoid = relation.oid \
+                          AND column_comment.classoid = 'pg_catalog.pg_class'::regclass \
+                          AND column_comment.objsubid = c.ordinal_position \
+                         LEFT JOIN pg_catalog.pg_description AS table_comment \
+                           ON table_comment.objoid = relation.oid \
+                          AND table_comment.classoid = 'pg_catalog.pg_class'::regclass \
+                          AND table_comment.objsubid = 0 \
+                         WHERE c.table_schema = $1 AND c.table_name = $2 \
+                         ORDER BY c.ordinal_position",
                         &[&schema, &table],
                     )
                     .await
@@ -436,6 +457,8 @@ impl Connector for PostgresConnector {
                         "SQL entity was not found",
                     ));
                 }
+                let table_comment = rows[0].get::<_, Option<String>>(5);
+                let table_kind = rows[0].get::<_, String>(6).to_ascii_lowercase();
                 let fields = rows
                     .into_iter()
                     .map(|row| {
@@ -447,19 +470,142 @@ impl Connector for PostgresConnector {
                                 DbValue::Bool(row.get::<_, String>(2) == "YES"),
                             ),
                             ("ordinal".into(), DbValue::Int64(row.get::<_, i64>(3))),
+                            (
+                                "comment".into(),
+                                row.get::<_, Option<String>>(4)
+                                    .map_or(DbValue::Null, DbValue::String),
+                            ),
                         ])
                     })
                     .collect();
+                let constraint_rows = client
+                    .query(
+                        "SELECT CASE constraint_info.contype \
+                                      WHEN 'p' THEN 'PRIMARY KEY' \
+                                      WHEN 'u' THEN 'UNIQUE' \
+                                END::text, \
+                                constraint_info.conname, attribute.attname, \
+                                constrained_column.ordinality::bigint \
+                         FROM pg_catalog.pg_constraint AS constraint_info \
+                         JOIN pg_catalog.pg_class AS table_relation \
+                           ON table_relation.oid = constraint_info.conrelid \
+                         JOIN pg_catalog.pg_namespace AS namespace \
+                           ON namespace.oid = table_relation.relnamespace \
+                         CROSS JOIN LATERAL unnest(constraint_info.conkey) WITH ORDINALITY \
+                           AS constrained_column(attnum, ordinality) \
+                         JOIN pg_catalog.pg_attribute AS attribute \
+                           ON attribute.attrelid = table_relation.oid \
+                          AND attribute.attnum = constrained_column.attnum \
+                         WHERE namespace.nspname = $1 AND table_relation.relname = $2 \
+                           AND constraint_info.contype IN ('p', 'u') \
+                         ORDER BY constraint_info.contype, constraint_info.conname, \
+                                  constrained_column.ordinality",
+                        &[&schema, &table],
+                    )
+                    .await
+                    .map_err(|error| map_pg_error(&error, false))?
+                    .into_iter()
+                    .map(|row| PostgresConstraintColumn {
+                        constraint_type: row.get(0),
+                        name: row.get(1),
+                        column: row.get(2),
+                        ordinal: row.get(3),
+                    })
+                    .collect::<Vec<_>>();
+                let foreign_key_rows = client
+                    .query(
+                        "SELECT foreign_key.conname, local_attribute.attname, \
+                                local_key.ordinality::bigint, \
+                                referenced_namespace.nspname, referenced_relation.relname, \
+                                referenced_attribute.attname \
+                         FROM pg_catalog.pg_constraint AS foreign_key \
+                         JOIN pg_catalog.pg_class AS local_relation \
+                           ON local_relation.oid = foreign_key.conrelid \
+                         JOIN pg_catalog.pg_namespace AS local_namespace \
+                           ON local_namespace.oid = local_relation.relnamespace \
+                         JOIN pg_catalog.pg_class AS referenced_relation \
+                           ON referenced_relation.oid = foreign_key.confrelid \
+                         JOIN pg_catalog.pg_namespace AS referenced_namespace \
+                           ON referenced_namespace.oid = referenced_relation.relnamespace \
+                         CROSS JOIN LATERAL unnest(foreign_key.conkey) WITH ORDINALITY \
+                           AS local_key(attnum, ordinality) \
+                         JOIN LATERAL unnest(foreign_key.confkey) WITH ORDINALITY \
+                           AS referenced_key(attnum, ordinality) \
+                           ON referenced_key.ordinality = local_key.ordinality \
+                         JOIN pg_catalog.pg_attribute AS local_attribute \
+                           ON local_attribute.attrelid = local_relation.oid \
+                          AND local_attribute.attnum = local_key.attnum \
+                         JOIN pg_catalog.pg_attribute AS referenced_attribute \
+                           ON referenced_attribute.attrelid = referenced_relation.oid \
+                          AND referenced_attribute.attnum = referenced_key.attnum \
+                         WHERE local_namespace.nspname = $1 AND local_relation.relname = $2 \
+                           AND foreign_key.contype = 'f' \
+                         ORDER BY foreign_key.conname, local_key.ordinality",
+                        &[&schema, &table],
+                    )
+                    .await
+                    .map_err(|error| map_pg_error(&error, false))?
+                    .into_iter()
+                    .map(|row| PostgresForeignKeyColumn {
+                        name: row.get(0),
+                        column: row.get(1),
+                        ordinal: row.get(2),
+                        referenced_schema: row.get(3),
+                        referenced_table: row.get(4),
+                        referenced_column: row.get(5),
+                    })
+                    .collect::<Vec<_>>();
+                let index_rows = client
+                    .query(
+                        "SELECT index_relation.relname, \
+                                COALESCE(attribute.attname, '<expression>'), \
+                                index_info.indisunique, indexed_column.ordinality::bigint \
+                         FROM pg_catalog.pg_class AS table_relation \
+                         JOIN pg_catalog.pg_namespace AS namespace \
+                           ON namespace.oid = table_relation.relnamespace \
+                         JOIN pg_catalog.pg_index AS index_info \
+                           ON index_info.indrelid = table_relation.oid \
+                         JOIN pg_catalog.pg_class AS index_relation \
+                           ON index_relation.oid = index_info.indexrelid \
+                         CROSS JOIN LATERAL unnest(index_info.indkey) WITH ORDINALITY \
+                           AS indexed_column(attnum, ordinality) \
+                         LEFT JOIN pg_catalog.pg_attribute AS attribute \
+                           ON attribute.attrelid = table_relation.oid \
+                          AND attribute.attnum = indexed_column.attnum \
+                         WHERE namespace.nspname = $1 AND table_relation.relname = $2 \
+                           AND index_info.indisvalid \
+                           AND indexed_column.ordinality <= index_info.indnkeyatts::bigint \
+                         ORDER BY index_relation.relname, indexed_column.ordinality",
+                        &[&schema, &table],
+                    )
+                    .await
+                    .map_err(|error| map_pg_error(&error, false))?
+                    .into_iter()
+                    .map(|row| PostgresIndexColumn {
+                        name: row.get(0),
+                        column: row.get(1),
+                        unique: row.get(2),
+                        ordinal: row.get(3),
+                    })
+                    .collect::<Vec<_>>();
+                let metadata = assemble_postgres_metadata(
+                    constraint_rows,
+                    foreign_key_rows,
+                    index_rows,
+                )
+                .into_record();
                 Ok(EntityDescription {
                     entity: CatalogEntity {
                         id: format!("{schema}.{table}"),
                         namespace: Some(schema),
                         name: table,
-                        kind: "table_or_view".into(),
-                        comment: None,
+                        kind: table_kind,
+                        comment: table_comment,
                     },
                     fields,
-                    metadata: BTreeMap::new(),
+                    metadata,
+                    truncated: false,
+                    warnings: Vec::new(),
                 })
             })
             .await
@@ -572,6 +718,124 @@ fn split_pg_entity(entity_id: &str) -> Result<(String, String)> {
         }
         _ => Err(invalid("PostgreSQL entity must use `schema.table`")),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostgresConstraintColumn {
+    constraint_type: String,
+    name: String,
+    column: String,
+    ordinal: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostgresForeignKeyColumn {
+    name: String,
+    column: String,
+    ordinal: i64,
+    referenced_schema: String,
+    referenced_table: String,
+    referenced_column: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostgresIndexColumn {
+    name: String,
+    column: String,
+    unique: bool,
+    ordinal: i64,
+}
+
+fn assemble_postgres_metadata(
+    constraints: Vec<PostgresConstraintColumn>,
+    foreign_keys: Vec<PostgresForeignKeyColumn>,
+    indexes: Vec<PostgresIndexColumn>,
+) -> RelationalMetadata {
+    let mut primary_keys = BTreeMap::<String, Vec<(i64, String)>>::new();
+    let mut unique_constraints = BTreeMap::<String, Vec<(i64, String)>>::new();
+    for column in constraints {
+        let target = if column.constraint_type == "PRIMARY KEY" {
+            &mut primary_keys
+        } else {
+            &mut unique_constraints
+        };
+        target
+            .entry(column.name)
+            .or_default()
+            .push((column.ordinal, column.column));
+    }
+
+    let primary_key = primary_keys
+        .into_iter()
+        .next()
+        .map(|(name, columns)| NamedColumns {
+            name,
+            columns: ordered_names(columns),
+        });
+    let unique_constraints = unique_constraints
+        .into_iter()
+        .map(|(name, columns)| NamedColumns {
+            name,
+            columns: ordered_names(columns),
+        })
+        .collect();
+
+    let mut grouped_foreign_keys = BTreeMap::<String, (String, Vec<(i64, String, String)>)>::new();
+    for column in foreign_keys {
+        let referenced_entity = format!("{}.{}", column.referenced_schema, column.referenced_table);
+        grouped_foreign_keys
+            .entry(column.name)
+            .or_insert_with(|| (referenced_entity, Vec::new()))
+            .1
+            .push((column.ordinal, column.column, column.referenced_column));
+    }
+    let foreign_keys = grouped_foreign_keys
+        .into_iter()
+        .map(|(name, (referenced_entity, mut columns))| {
+            columns.sort_by_key(|(ordinal, _, _)| *ordinal);
+            ForeignKeyMetadata {
+                name,
+                columns: columns
+                    .iter()
+                    .map(|(_, column, _)| column.clone())
+                    .collect(),
+                referenced_entity,
+                referenced_columns: columns
+                    .into_iter()
+                    .map(|(_, _, referenced_column)| referenced_column)
+                    .collect(),
+            }
+        })
+        .collect();
+
+    let mut grouped_indexes = BTreeMap::<String, (bool, Vec<(i64, String)>)>::new();
+    for column in indexes {
+        grouped_indexes
+            .entry(column.name)
+            .or_insert_with(|| (column.unique, Vec::new()))
+            .1
+            .push((column.ordinal, column.column));
+    }
+    let indexes = grouped_indexes
+        .into_iter()
+        .map(|(name, (unique, columns))| IndexMetadata {
+            name,
+            columns: ordered_names(columns),
+            unique,
+        })
+        .collect();
+
+    RelationalMetadata {
+        primary_key,
+        foreign_keys,
+        unique_constraints,
+        indexes,
+    }
+}
+
+fn ordered_names(mut columns: Vec<(i64, String)>) -> Vec<String> {
+    columns.sort_by_key(|(ordinal, _)| *ordinal);
+    columns.into_iter().map(|(_, name)| name).collect()
 }
 
 fn build_config(profile: &ConnectionProfile, secret: &SecretMaterial) -> Result<Config> {
@@ -858,7 +1122,7 @@ where
         .query(&wrapped, &parameter_refs)
         .await
         .map_err(|error| map_pg_error(&error, false))?;
-    let mut records = rows
+    let records = rows
         .into_iter()
         .map(|row| row.try_get::<_, serde_json::Value>(0))
         .map(|result| {
@@ -868,23 +1132,15 @@ where
         })
         .collect::<Result<Vec<_>>>()?;
     let row_limit = built.row_limit.unwrap_or(context.max_rows as usize);
-    let truncated = truncate_records(&mut records, row_limit, context.max_bytes)?;
-    let next_cursor = if truncated {
-        built
-            .base_offset
-            .map(|offset| offset.saturating_add(records.len() as u64))
-            .map(encode_offset)
-            .transpose()?
-    } else {
-        None
-    };
-    Ok(read_result(
-        context,
-        started,
-        records,
-        truncated,
-        next_cursor,
-    ))
+    let mut result = read_result(context, started, records, false, None);
+    truncate_records(
+        &mut result,
+        row_limit,
+        context.max_bytes,
+        false,
+        built.base_offset,
+    )?;
+    Ok(result)
 }
 
 async fn native_query(
@@ -1240,9 +1496,20 @@ fn db_value_to_json(value: &DbValue) -> serde_json::Value {
 }
 
 fn map_pg_error(error: &tokio_postgres::Error, write: bool) -> ConnectorError {
-    let tls_failure = error_sources_include_rustls(error);
+    let tls_failure = pg_error_is_tls(error);
+    if tls_failure {
+        return ConnectorError::new(
+            if write {
+                ErrorCategory::UnknownOutcome
+            } else {
+                ErrorCategory::Unavailable
+            },
+            "PostgreSQL TLS handshake failed",
+        )
+        .with_phase(ErrorPhase::Tls);
+    }
     if error.is_closed() {
-        let mapped = ConnectorError::new(
+        return ConnectorError::new(
             if write {
                 ErrorCategory::UnknownOutcome
             } else {
@@ -1250,15 +1517,11 @@ fn map_pg_error(error: &tokio_postgres::Error, write: bool) -> ConnectorError {
             },
             "PostgreSQL connection closed while processing the request",
         )
+        .with_phase(ErrorPhase::Network)
         .retryable(!write);
-        return if tls_failure {
-            mapped.with_phase(ErrorPhase::Tls)
-        } else {
-            mapped.with_phase(ErrorPhase::Network)
-        };
     }
     let Some(code) = error.code() else {
-        if !tls_failure && error_sources_include_io(error) {
+        if error_sources_include_io(error) {
             return ConnectorError::new(
                 if write {
                     ErrorCategory::UnknownOutcome
@@ -1270,7 +1533,7 @@ fn map_pg_error(error: &tokio_postgres::Error, write: bool) -> ConnectorError {
             .with_phase(ErrorPhase::Network)
             .retryable(!write);
         }
-        let mapped = ConnectorError::new(
+        return ConnectorError::new(
             if write {
                 ErrorCategory::UnknownOutcome
             } else {
@@ -1278,11 +1541,6 @@ fn map_pg_error(error: &tokio_postgres::Error, write: bool) -> ConnectorError {
             },
             "PostgreSQL driver rejected the request",
         );
-        return if tls_failure {
-            mapped.with_phase(ErrorPhase::Tls)
-        } else {
-            mapped
-        };
     };
     let category = if code == &SqlState::INVALID_PASSWORD || code.code().starts_with("28") {
         ErrorCategory::Authentication
@@ -1311,10 +1569,33 @@ fn map_pg_error(error: &tokio_postgres::Error, write: bool) -> ConnectorError {
     .retryable(code.code().starts_with("08") && !write)
 }
 
-fn error_sources_include_rustls(error: &tokio_postgres::Error) -> bool {
-    let mut source = StdError::source(error);
+fn pg_error_is_tls(error: &tokio_postgres::Error) -> bool {
+    // tokio-postgres has no public error-kind accessor. Its exact pinned version uses this
+    // fixed, value-free display text for every error created by Error::tls.
+    error.to_string() == "error performing TLS handshake" || error_chain_includes_rustls(error)
+}
+
+fn error_chain_includes_rustls(error: &(dyn StdError + 'static)) -> bool {
+    if error.is::<rustls::Error>() {
+        return true;
+    }
+    if let Some(io_error) = error.downcast_ref::<std::io::Error>()
+        && io_error
+            .get_ref()
+            .is_some_and(|source| error_chain_includes_rustls(source))
+    {
+        return true;
+    }
+    let mut source = error.source();
     while let Some(current) = source {
         if current.is::<rustls::Error>() {
+            return true;
+        }
+        if let Some(io_error) = current.downcast_ref::<std::io::Error>()
+            && io_error
+                .get_ref()
+                .is_some_and(|source| error_chain_includes_rustls(source))
+        {
             return true;
         }
         source = current.source();
@@ -1342,10 +1623,16 @@ mod tests {
         AuthKind, ConnectionId, ConnectionPolicy, ConnectionProfile, Connector, ErrorCategory,
         Product, SecretMaterial, TlsConfig,
     };
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        net::TcpListener,
+    };
     use url::Url;
 
     use super::{
-        PostgresConnector, PostgresFlavor, build_tls_config, encode_pg_numeric, tls_secret_value,
+        PostgresConnector, PostgresConstraintColumn, PostgresFlavor, PostgresForeignKeyColumn,
+        PostgresIndexColumn, assemble_postgres_metadata, build_config, build_tls_config,
+        encode_pg_numeric, error_chain_includes_rustls, map_pg_error, tls_secret_value,
         verify_server_flavor,
     };
 
@@ -1397,6 +1684,81 @@ mod tests {
     }
 
     #[test]
+    fn relational_metadata_preserves_composite_column_order_and_foreign_key_mapping() {
+        let metadata = assemble_postgres_metadata(
+            vec![
+                PostgresConstraintColumn {
+                    constraint_type: "PRIMARY KEY".into(),
+                    name: "orders_pkey".into(),
+                    column: "region_id".into(),
+                    ordinal: 2,
+                },
+                PostgresConstraintColumn {
+                    constraint_type: "PRIMARY KEY".into(),
+                    name: "orders_pkey".into(),
+                    column: "order_id".into(),
+                    ordinal: 1,
+                },
+                PostgresConstraintColumn {
+                    constraint_type: "UNIQUE".into(),
+                    name: "orders_external_key".into(),
+                    column: "external_id".into(),
+                    ordinal: 1,
+                },
+            ],
+            vec![
+                PostgresForeignKeyColumn {
+                    name: "orders_customer_fkey".into(),
+                    column: "customer_region".into(),
+                    ordinal: 2,
+                    referenced_schema: "crm".into(),
+                    referenced_table: "customers".into(),
+                    referenced_column: "region_id".into(),
+                },
+                PostgresForeignKeyColumn {
+                    name: "orders_customer_fkey".into(),
+                    column: "customer_id".into(),
+                    ordinal: 1,
+                    referenced_schema: "crm".into(),
+                    referenced_table: "customers".into(),
+                    referenced_column: "customer_id".into(),
+                },
+            ],
+            vec![
+                PostgresIndexColumn {
+                    name: "orders_created_idx".into(),
+                    column: "order_id".into(),
+                    unique: false,
+                    ordinal: 2,
+                },
+                PostgresIndexColumn {
+                    name: "orders_created_idx".into(),
+                    column: "created_at".into(),
+                    unique: false,
+                    ordinal: 1,
+                },
+            ],
+        );
+
+        assert_eq!(
+            metadata.primary_key.unwrap().columns,
+            ["order_id", "region_id"]
+        );
+        assert_eq!(metadata.unique_constraints[0].columns, ["external_id"]);
+        assert_eq!(
+            metadata.foreign_keys[0].columns,
+            ["customer_id", "customer_region"]
+        );
+        assert_eq!(
+            metadata.foreign_keys[0].referenced_columns,
+            ["customer_id", "region_id"]
+        );
+        assert_eq!(metadata.foreign_keys[0].referenced_entity, "crm.customers");
+        assert_eq!(metadata.indexes[0].columns, ["created_at", "order_id"]);
+        assert!(!metadata.indexes[0].unique);
+    }
+
+    #[test]
     fn numeric_parameters_use_lossless_postgres_binary_encoding() {
         fn encoded(value: &str) -> Vec<u8> {
             let mut output = BytesMut::new();
@@ -1429,6 +1791,60 @@ mod tests {
             error.message,
             "PostgreSQL CA certificate credential contains no certificates"
         );
+    }
+
+    #[test]
+    fn rustls_error_nested_in_io_error_is_detected() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::General("certificate rejected".into()),
+        );
+
+        assert!(error_chain_includes_rustls(&error));
+    }
+
+    #[tokio::test]
+    async fn server_rejecting_tls_is_safely_classified_as_tls() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut ssl_request = [0_u8; 8];
+            stream.read_exact(&mut ssl_request).await.unwrap();
+            assert_eq!(ssl_request, [0, 0, 0, 8, 4, 210, 22, 47]);
+            stream.write_all(b"N").await.unwrap();
+        });
+
+        let mut profile = profile();
+        profile.endpoint = Url::parse(&format!("postgresql://{address}")).unwrap();
+        profile.database = Some("sensitive-database".into());
+        profile.tls.enabled = true;
+        let secret = SecretMaterial {
+            kind: AuthKind::UsernamePassword,
+            fields: BTreeMap::from([
+                ("username".into(), "sensitive-user".into()),
+                ("password".into(), "sensitive-password".into()),
+            ]),
+        };
+        let config = build_config(&profile, &secret).unwrap();
+        let tls = tokio_postgres_rustls::MakeRustlsConnect::new(
+            build_tls_config(&profile, &secret).unwrap(),
+        );
+        let error = match config.connect(tls).await {
+            Ok(_) => panic!("a server refusing TLS must not be accepted"),
+            Err(error) => error,
+        };
+        server.await.unwrap();
+
+        let mapped = map_pg_error(&error, false);
+        assert_eq!(mapped.category, ErrorCategory::Unavailable);
+        assert_eq!(mapped.phase, connector_core::ErrorPhase::Tls);
+        assert_eq!(mapped.message, "PostgreSQL TLS handshake failed");
+        assert!(!mapped.retryable);
+        let serialized = serde_json::to_string(&mapped).unwrap();
+        for secret in ["sensitive-user", "sensitive-password", "sensitive-database"] {
+            assert!(!serialized.contains(secret));
+        }
     }
 
     #[test]

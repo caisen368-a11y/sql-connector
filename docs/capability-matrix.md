@@ -31,6 +31,22 @@ advertises no `Read`, `Insert`, `Update`, `Delete`, native, search, vector, or
 time-series capabilities. Tools must call `db_get_capabilities` before routing
 an operation and must surface the connector's limitations to the user.
 
+## Tier 1 connectors
+
+Tier 1 is a support priority, not a verification claim. The initial Tier 1
+cohort is `mysql-protocol` and `postgresql-pgwire`. Both remain `Experimental`
+until their declared server versions pass the real Worker + MCP matrix on
+macOS Intel, macOS ARM, and Windows.
+
+The machine-readable source of truth is
+[`connector-certification.json`](connector-certification.json). Its Tier 1
+contract requires connection testing, bounded reads, schema inspection, TLS
+server verification, cancellation, and Worker restart recovery. A connector
+may be marked `Verified` only when the ledger contains an exact copy of its
+current descriptor plus tested versions, all release platforms, the tested
+commit, and the successful GitHub Actions run URL. Descriptor changes
+invalidate earlier evidence.
+
 ## Certification gates
 
 A connector can move from `Experimental` to `Verified` only after all of the

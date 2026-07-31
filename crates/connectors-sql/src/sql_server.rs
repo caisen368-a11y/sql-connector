@@ -35,6 +35,7 @@ use crate::{
         effective_write_limit, invalid, parse_native, required_secret, truncate_records,
         unsupported, validate_auth, validate_tls,
     },
+    relational_metadata::{ForeignKeyMetadata, IndexMetadata, NamedColumns, RelationalMetadata},
 };
 
 type TdsClient = Client<Compat<TcpStream>>;
@@ -335,10 +336,13 @@ impl Connector for SqlServerConnector {
                 let offset = decode_offset(query.cursor.as_deref())?;
                 let pattern = query.pattern.map(|value| format!("%{value}%"));
                 let built = BuiltQuery {
-                    sql: "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES \
-                          WHERE (@P1 IS NULL OR TABLE_SCHEMA = @P1) \
-                          AND (@P2 IS NULL OR TABLE_NAME LIKE @P2) \
-                          ORDER BY TABLE_SCHEMA, TABLE_NAME OFFSET @P3 ROWS FETCH NEXT @P4 ROWS ONLY"
+                    sql: "SELECT T.TABLE_SCHEMA, T.TABLE_NAME, T.TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES AS T \
+                          WHERE (@P1 IS NULL OR T.TABLE_SCHEMA = @P1) \
+                          AND (@P2 IS NULL OR T.TABLE_NAME LIKE @P2 \
+                               OR EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS AS C \
+                                          WHERE C.TABLE_SCHEMA = T.TABLE_SCHEMA \
+                                          AND C.TABLE_NAME = T.TABLE_NAME AND C.COLUMN_NAME LIKE @P2)) \
+                          ORDER BY T.TABLE_SCHEMA, T.TABLE_NAME OFFSET @P3 ROWS FETCH NEXT @P4 ROWS ONLY"
                         .into(),
                     parameters: vec![
                         query.namespace.map_or(DbValue::Null, DbValue::String),
@@ -408,9 +412,24 @@ impl Connector for SqlServerConnector {
                 let mut client = connect(&pools, &profile, &secret, timeout).await?;
                 let rows = run_tds_query(
                     &mut client,
-                    "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, ORDINAL_POSITION \
-                     FROM INFORMATION_SCHEMA.COLUMNS \
-                     WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2 ORDER BY ORDINAL_POSITION"
+                    "SELECT C.COLUMN_NAME, C.DATA_TYPE, C.IS_NULLABLE, C.ORDINAL_POSITION, \
+                            CONVERT(nvarchar(max), CP.value) AS COLUMN_COMMENT, \
+                            CONVERT(nvarchar(max), TP.value) AS TABLE_COMMENT \
+                     FROM INFORMATION_SCHEMA.COLUMNS AS C \
+                     LEFT JOIN sys.schemas AS S ON S.name = C.TABLE_SCHEMA \
+                     LEFT JOIN sys.objects AS O \
+                       ON O.schema_id = S.schema_id AND O.name = C.TABLE_NAME \
+                      AND O.type IN ('U', 'V') \
+                     LEFT JOIN sys.columns AS SC \
+                       ON SC.object_id = O.object_id AND SC.name = C.COLUMN_NAME \
+                     LEFT JOIN sys.extended_properties AS CP \
+                       ON CP.class = 1 AND CP.major_id = O.object_id \
+                      AND CP.minor_id = SC.column_id AND CP.name = N'MS_Description' \
+                     LEFT JOIN sys.extended_properties AS TP \
+                       ON TP.class = 1 AND TP.major_id = O.object_id \
+                      AND TP.minor_id = 0 AND TP.name = N'MS_Description' \
+                     WHERE C.TABLE_SCHEMA = @P1 AND C.TABLE_NAME = @P2 \
+                     ORDER BY C.ORDINAL_POSITION"
                         .into(),
                     vec![
                         DbValue::String(schema.clone()),
@@ -424,10 +443,11 @@ impl Connector for SqlServerConnector {
                         "SQL entity was not found",
                     ));
                 }
+                let table_comment = optional_tds_string(&rows[0], 5)?;
                 let fields = rows
                     .iter()
                     .map(|row| {
-                        Ok(BTreeMap::from([
+                        let mut field = BTreeMap::from([
                             ("name".into(), DbValue::String(required_tds_string(row, 0)?)),
                             ("type".into(), DbValue::String(required_tds_string(row, 1)?)),
                             (
@@ -447,9 +467,103 @@ impl Connector for SqlServerConnector {
                                         })?,
                                 )),
                             ),
-                        ]))
+                        ]);
+                        field.insert(
+                            "comment".into(),
+                            optional_tds_string(row, 4)?.map_or(DbValue::Null, DbValue::String),
+                        );
+                        Ok(field)
                     })
                     .collect::<Result<Vec<_>>>()?;
+                let constraint_rows = run_tds_query(
+                    &mut client,
+                    "SELECT CONSTRAINT_KIND, CONSTRAINT_NAME, COLUMN_NAME, ORDINAL, \
+                            REFERENCED_SCHEMA, REFERENCED_TABLE, REFERENCED_COLUMN \
+                     FROM ( \
+                       SELECT CAST(CASE KC.type WHEN 'PK' THEN N'PRIMARY_KEY' \
+                                                   ELSE N'UNIQUE_CONSTRAINT' END AS nvarchar(32)) \
+                                AS CONSTRAINT_KIND, \
+                              KC.name AS CONSTRAINT_NAME, C.name AS COLUMN_NAME, \
+                              CAST(CASE WHEN IC.key_ordinal > 0 THEN IC.key_ordinal \
+                                        ELSE IC.index_column_id END AS int) AS ORDINAL, \
+                              CAST(NULL AS nvarchar(128)) AS REFERENCED_SCHEMA, \
+                              CAST(NULL AS nvarchar(128)) AS REFERENCED_TABLE, \
+                              CAST(NULL AS nvarchar(128)) AS REFERENCED_COLUMN \
+                       FROM sys.key_constraints AS KC \
+                       INNER JOIN sys.objects AS O ON O.object_id = KC.parent_object_id \
+                       INNER JOIN sys.schemas AS S ON S.schema_id = O.schema_id \
+                       INNER JOIN sys.index_columns AS IC \
+                         ON IC.object_id = KC.parent_object_id \
+                        AND IC.index_id = KC.unique_index_id \
+                        AND IC.is_included_column = 0 \
+                       INNER JOIN sys.columns AS C \
+                         ON C.object_id = IC.object_id AND C.column_id = IC.column_id \
+                       WHERE S.name = @P1 AND O.name = @P2 AND KC.type IN ('PK', 'UQ') \
+                       UNION ALL \
+                       SELECT CAST(N'FOREIGN_KEY' AS nvarchar(32)) AS CONSTRAINT_KIND, \
+                              FK.name AS CONSTRAINT_NAME, PC.name AS COLUMN_NAME, \
+                              FKC.constraint_column_id AS ORDINAL, \
+                              RS.name AS REFERENCED_SCHEMA, RO.name AS REFERENCED_TABLE, \
+                              RC.name AS REFERENCED_COLUMN \
+                       FROM sys.foreign_keys AS FK \
+                       INNER JOIN sys.foreign_key_columns AS FKC \
+                         ON FKC.constraint_object_id = FK.object_id \
+                       INNER JOIN sys.objects AS PO ON PO.object_id = FK.parent_object_id \
+                       INNER JOIN sys.schemas AS PS ON PS.schema_id = PO.schema_id \
+                       INNER JOIN sys.columns AS PC \
+                         ON PC.object_id = FKC.parent_object_id \
+                        AND PC.column_id = FKC.parent_column_id \
+                       INNER JOIN sys.objects AS RO \
+                         ON RO.object_id = FKC.referenced_object_id \
+                       INNER JOIN sys.schemas AS RS ON RS.schema_id = RO.schema_id \
+                       INNER JOIN sys.columns AS RC \
+                         ON RC.object_id = FKC.referenced_object_id \
+                        AND RC.column_id = FKC.referenced_column_id \
+                       WHERE PS.name = @P1 AND PO.name = @P2 \
+                     ) AS RELATION_COLUMNS \
+                     ORDER BY CONSTRAINT_KIND, CONSTRAINT_NAME, ORDINAL"
+                        .into(),
+                    vec![
+                        DbValue::String(schema.clone()),
+                        DbValue::String(table.clone()),
+                    ],
+                )
+                .await?;
+                let constraint_columns = constraint_rows
+                    .iter()
+                    .map(tds_constraint_column)
+                    .collect::<Result<Vec<_>>>()?;
+
+                let index_rows = run_tds_query(
+                    &mut client,
+                    "SELECT I.name, C.name, \
+                            CAST(CASE WHEN IC.key_ordinal > 0 THEN IC.key_ordinal \
+                                      ELSE IC.index_column_id END AS int) AS ORDINAL, \
+                            I.is_unique \
+                     FROM sys.indexes AS I \
+                     INNER JOIN sys.objects AS O ON O.object_id = I.object_id \
+                     INNER JOIN sys.schemas AS S ON S.schema_id = O.schema_id \
+                     INNER JOIN sys.index_columns AS IC \
+                       ON IC.object_id = I.object_id AND IC.index_id = I.index_id \
+                      AND (IC.is_included_column = 0 OR I.type IN (5, 6)) \
+                     INNER JOIN sys.columns AS C \
+                       ON C.object_id = IC.object_id AND C.column_id = IC.column_id \
+                     WHERE S.name = @P1 AND O.name = @P2 AND I.index_id > 0 \
+                       AND I.is_hypothetical = 0 \
+                     ORDER BY I.name, ORDINAL"
+                        .into(),
+                    vec![
+                        DbValue::String(schema.clone()),
+                        DbValue::String(table.clone()),
+                    ],
+                )
+                .await?;
+                let index_columns = index_rows
+                    .iter()
+                    .map(tds_index_column)
+                    .collect::<Result<Vec<_>>>()?;
+                let metadata =
+                    group_tds_relational_metadata(constraint_columns, index_columns).into_record();
                 client.mark_reusable();
                 Ok(EntityDescription {
                     entity: CatalogEntity {
@@ -457,10 +571,12 @@ impl Connector for SqlServerConnector {
                         namespace: Some(schema),
                         name: table,
                         kind: "table_or_view".into(),
-                        comment: None,
+                        comment: table_comment,
                     },
                     fields,
-                    metadata: BTreeMap::new(),
+                    metadata,
+                    truncated: false,
+                    warnings: Vec::new(),
                 })
             })
             .await
@@ -504,6 +620,164 @@ impl Connector for SqlServerConnector {
 
     async fn cancel(&self, request_id: &str) -> Result<()> {
         self.cancellation.cancel(request_id).await
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TdsConstraintKind {
+    PrimaryKey,
+    ForeignKey {
+        referenced_entity: String,
+        referenced_column: String,
+    },
+    UniqueConstraint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TdsConstraintColumn {
+    kind: TdsConstraintKind,
+    name: String,
+    column: String,
+    ordinal: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TdsIndexColumn {
+    name: String,
+    column: String,
+    ordinal: i32,
+    unique: bool,
+}
+
+fn tds_constraint_column(row: &Row) -> Result<TdsConstraintColumn> {
+    let kind = match required_tds_string(row, 0)?.as_str() {
+        "PRIMARY_KEY" => TdsConstraintKind::PrimaryKey,
+        "FOREIGN_KEY" => TdsConstraintKind::ForeignKey {
+            referenced_entity: format!(
+                "{}.{}",
+                required_tds_string(row, 4)?,
+                required_tds_string(row, 5)?
+            ),
+            referenced_column: required_tds_string(row, 6)?,
+        },
+        "UNIQUE_CONSTRAINT" => TdsConstraintKind::UniqueConstraint,
+        _ => {
+            return Err(ConnectorError::new(
+                ErrorCategory::Protocol,
+                "SQL Server returned an unexpected constraint kind",
+            ));
+        }
+    };
+    Ok(TdsConstraintColumn {
+        kind,
+        name: required_tds_string(row, 1)?,
+        column: required_tds_string(row, 2)?,
+        ordinal: required_tds_i32(row, 3)?,
+    })
+}
+
+fn tds_index_column(row: &Row) -> Result<TdsIndexColumn> {
+    Ok(TdsIndexColumn {
+        name: required_tds_string(row, 0)?,
+        column: required_tds_string(row, 1)?,
+        ordinal: required_tds_i32(row, 2)?,
+        unique: row
+            .try_get::<bool, _>(3)
+            .map_err(|error| map_tds_error(&error, false))?
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ErrorCategory::Protocol,
+                    "SQL Server returned a NULL index uniqueness flag",
+                )
+            })?,
+    })
+}
+
+fn group_tds_relational_metadata(
+    constraint_columns: Vec<TdsConstraintColumn>,
+    index_columns: Vec<TdsIndexColumn>,
+) -> RelationalMetadata {
+    let mut primary_keys = BTreeMap::<String, Vec<(i32, String)>>::new();
+    let mut foreign_keys = BTreeMap::<(String, String), Vec<(i32, String, String)>>::new();
+    let mut unique_constraints = BTreeMap::<String, Vec<(i32, String)>>::new();
+    for column in constraint_columns {
+        match column.kind {
+            TdsConstraintKind::PrimaryKey => primary_keys
+                .entry(column.name)
+                .or_default()
+                .push((column.ordinal, column.column)),
+            TdsConstraintKind::ForeignKey {
+                referenced_entity,
+                referenced_column,
+            } => foreign_keys
+                .entry((column.name, referenced_entity))
+                .or_default()
+                .push((column.ordinal, column.column, referenced_column)),
+            TdsConstraintKind::UniqueConstraint => unique_constraints
+                .entry(column.name)
+                .or_default()
+                .push((column.ordinal, column.column)),
+        }
+    }
+
+    let primary_key = primary_keys.into_iter().next().map(|(name, mut columns)| {
+        columns.sort_by_key(|(ordinal, _)| *ordinal);
+        NamedColumns {
+            name,
+            columns: columns.into_iter().map(|(_, column)| column).collect(),
+        }
+    });
+    let foreign_keys = foreign_keys
+        .into_iter()
+        .map(|((name, referenced_entity), mut columns)| {
+            columns.sort_by_key(|(ordinal, _, _)| *ordinal);
+            let (columns, referenced_columns): (Vec<_>, Vec<_>) = columns
+                .into_iter()
+                .map(|(_, column, referenced_column)| (column, referenced_column))
+                .unzip();
+            ForeignKeyMetadata {
+                name,
+                columns,
+                referenced_entity,
+                referenced_columns,
+            }
+        })
+        .collect();
+    let unique_constraints = unique_constraints
+        .into_iter()
+        .map(|(name, mut columns)| {
+            columns.sort_by_key(|(ordinal, _)| *ordinal);
+            NamedColumns {
+                name,
+                columns: columns.into_iter().map(|(_, column)| column).collect(),
+            }
+        })
+        .collect();
+
+    let mut grouped_indexes = BTreeMap::<(String, bool), Vec<(i32, String)>>::new();
+    for column in index_columns {
+        grouped_indexes
+            .entry((column.name, column.unique))
+            .or_default()
+            .push((column.ordinal, column.column));
+    }
+    let indexes = grouped_indexes
+        .into_iter()
+        .map(|((name, unique), mut columns)| {
+            columns.sort_by_key(|(ordinal, _)| *ordinal);
+            IndexMetadata {
+                name,
+                columns: columns.into_iter().map(|(_, column)| column).collect(),
+                unique,
+            }
+        })
+        .collect();
+
+    RelationalMetadata {
+        primary_key,
+        foreign_keys,
+        unique_constraints,
+        indexes,
     }
 }
 
@@ -830,23 +1104,15 @@ async fn query_built(
         };
         records.push(tds_row_to_record(&row)?);
     }
-    let truncated = truncate_records(&mut records, row_limit, context.max_bytes)?;
-    let next_cursor = if truncated {
-        built
-            .base_offset
-            .map(|offset| offset.saturating_add(records.len() as u64))
-            .map(crate::common::encode_offset)
-            .transpose()?
-    } else {
-        None
-    };
-    Ok(read_result(
-        context,
-        started,
-        records,
-        truncated,
-        next_cursor,
-    ))
+    let mut result = read_result(context, started, records, false, None);
+    truncate_records(
+        &mut result,
+        row_limit,
+        context.max_bytes,
+        false,
+        built.base_offset,
+    )?;
+    Ok(result)
 }
 
 async fn native_query(
@@ -1107,6 +1373,23 @@ fn required_tds_string(row: &Row, index: usize) -> Result<String> {
         })
 }
 
+fn optional_tds_string(row: &Row, index: usize) -> Result<Option<String>> {
+    row.try_get::<&str, _>(index)
+        .map_err(|error| map_tds_error(&error, false))
+        .map(|value| value.map(str::to_owned))
+}
+
+fn required_tds_i32(row: &Row, index: usize) -> Result<i32> {
+    row.try_get::<i32, _>(index)
+        .map_err(|error| map_tds_error(&error, false))?
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ErrorCategory::Protocol,
+                "SQL Server returned an unexpected NULL catalog ordinal",
+            )
+        })
+}
+
 fn read_result(
     context: &ConnectorContext,
     started: Instant,
@@ -1197,7 +1480,10 @@ mod tests {
     };
     use url::Url;
 
-    use super::{SqlServerConnector, build_config, validate_ado_auth};
+    use super::{
+        SqlServerConnector, TdsConstraintColumn, TdsConstraintKind, TdsIndexColumn, build_config,
+        group_tds_relational_metadata, validate_ado_auth,
+    };
 
     fn profile() -> ConnectionProfile {
         ConnectionProfile {
@@ -1233,6 +1519,97 @@ mod tests {
         let manifest = SqlServerConnector::new().manifest();
         assert_eq!(manifest.product, Product::SqlServer);
         assert_eq!(manifest.api_mode, "tds");
+    }
+
+    #[test]
+    fn relational_metadata_groups_composite_columns_by_ordinal() {
+        let metadata = group_tds_relational_metadata(
+            vec![
+                TdsConstraintColumn {
+                    kind: TdsConstraintKind::PrimaryKey,
+                    name: "PK_orders".into(),
+                    column: "order_id".into(),
+                    ordinal: 2,
+                },
+                TdsConstraintColumn {
+                    kind: TdsConstraintKind::PrimaryKey,
+                    name: "PK_orders".into(),
+                    column: "tenant_id".into(),
+                    ordinal: 1,
+                },
+                TdsConstraintColumn {
+                    kind: TdsConstraintKind::ForeignKey {
+                        referenced_entity: "accounts.customers".into(),
+                        referenced_column: "customer_id".into(),
+                    },
+                    name: "FK_orders_customers".into(),
+                    column: "customer_id".into(),
+                    ordinal: 2,
+                },
+                TdsConstraintColumn {
+                    kind: TdsConstraintKind::ForeignKey {
+                        referenced_entity: "accounts.customers".into(),
+                        referenced_column: "tenant_id".into(),
+                    },
+                    name: "FK_orders_customers".into(),
+                    column: "tenant_id".into(),
+                    ordinal: 1,
+                },
+                TdsConstraintColumn {
+                    kind: TdsConstraintKind::UniqueConstraint,
+                    name: "UQ_orders_reference".into(),
+                    column: "reference".into(),
+                    ordinal: 1,
+                },
+            ],
+            vec![
+                TdsIndexColumn {
+                    name: "IX_orders_status_created".into(),
+                    column: "created_at".into(),
+                    ordinal: 2,
+                    unique: false,
+                },
+                TdsIndexColumn {
+                    name: "IX_orders_status_created".into(),
+                    column: "status".into(),
+                    ordinal: 1,
+                    unique: false,
+                },
+                TdsIndexColumn {
+                    name: "PK_orders".into(),
+                    column: "order_id".into(),
+                    ordinal: 2,
+                    unique: true,
+                },
+                TdsIndexColumn {
+                    name: "PK_orders".into(),
+                    column: "tenant_id".into(),
+                    ordinal: 1,
+                    unique: true,
+                },
+            ],
+        );
+
+        assert_eq!(
+            metadata.primary_key.unwrap().columns,
+            ["tenant_id", "order_id"]
+        );
+        assert_eq!(
+            metadata.foreign_keys[0].columns,
+            ["tenant_id", "customer_id"]
+        );
+        assert_eq!(
+            metadata.foreign_keys[0].referenced_columns,
+            ["tenant_id", "customer_id"]
+        );
+        assert_eq!(
+            metadata.foreign_keys[0].referenced_entity,
+            "accounts.customers"
+        );
+        assert_eq!(metadata.unique_constraints[0].columns, ["reference"]);
+        assert_eq!(metadata.indexes[0].columns, ["status", "created_at"]);
+        assert_eq!(metadata.indexes[1].columns, ["tenant_id", "order_id"]);
+        assert!(metadata.indexes[1].unique);
     }
 
     #[test]

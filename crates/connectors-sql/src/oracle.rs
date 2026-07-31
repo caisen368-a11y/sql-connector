@@ -35,9 +35,10 @@ use crate::{
     common::{
         BuiltQuery, SqlFamily, build_delete, build_insert, build_read, build_update,
         catalog_fetch_inputs, catalog_page, decode_offset, effective_row_limit, effective_timeout,
-        effective_write_limit, encode_offset, invalid, parse_native, required_secret,
-        truncate_records, unsupported, validate_auth, validate_tls,
+        effective_write_limit, invalid, parse_native, required_secret, truncate_records,
+        unsupported, validate_auth, validate_tls,
     },
+    relational_metadata::{ForeignKeyMetadata, IndexMetadata, NamedColumns, RelationalMetadata},
 };
 
 /// Oracle Database connector backed by the pure Rust TNS driver `oracle-rs`.
@@ -297,22 +298,31 @@ impl Connector for OracleConnector {
                     .min(profile.policy.max_rows);
                 let offset = decode_offset(query.cursor.as_deref())?;
                 let mut sql = String::from(
-                    "SELECT OWNER, OBJECT_NAME, OBJECT_TYPE FROM ALL_OBJECTS WHERE OBJECT_TYPE IN ('TABLE', 'VIEW')",
+                    "SELECT O.OWNER, O.OBJECT_NAME, O.OBJECT_TYPE FROM ALL_OBJECTS O WHERE O.OBJECT_TYPE IN ('TABLE', 'VIEW')",
                 );
                 let mut parameters = Vec::new();
                 if let Some(namespace) = query.namespace.as_deref() {
                     parameters.push(Value::String(namespace.to_ascii_uppercase()));
-                    write!(&mut sql, " AND OWNER = :{}", parameters.len())
+                    write!(&mut sql, " AND O.OWNER = :{}", parameters.len())
                         .expect("writing to a string cannot fail");
                 }
                 if let Some(pattern) = query.pattern.as_deref() {
-                    parameters.push(Value::String(format!("%{}%", pattern.to_ascii_uppercase())));
-                    write!(&mut sql, " AND OBJECT_NAME LIKE :{}", parameters.len())
-                        .expect("writing to a string cannot fail");
+                    let pattern = format!("%{}%", pattern.to_ascii_uppercase());
+                    parameters.push(Value::String(pattern.clone()));
+                    let object_pattern = parameters.len();
+                    parameters.push(Value::String(pattern));
+                    let column_pattern = parameters.len();
+                    write!(
+                        &mut sql,
+                        " AND (O.OBJECT_NAME LIKE :{object_pattern} OR EXISTS (\
+                         SELECT 1 FROM ALL_TAB_COLUMNS C WHERE C.OWNER = O.OWNER \
+                         AND C.TABLE_NAME = O.OBJECT_NAME AND C.COLUMN_NAME LIKE :{column_pattern}))"
+                    )
+                    .expect("writing to a string cannot fail");
                 }
                 write!(
                     &mut sql,
-                    " ORDER BY OWNER, OBJECT_NAME OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
+                    " ORDER BY O.OWNER, O.OBJECT_NAME OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
                 )
                 .expect("writing to a string cannot fail");
                 let result = connection
@@ -375,8 +385,10 @@ impl Connector for OracleConnector {
                 let connection = connect(&pools, &profile, &secret, timeout).await?;
                 let result = connection
                     .query(
-                        "SELECT COLUMN_NAME, DATA_TYPE, NULLABLE, COLUMN_ID, DATA_LENGTH, DATA_PRECISION, DATA_SCALE \
-                         FROM ALL_TAB_COLUMNS WHERE OWNER = :1 AND TABLE_NAME = :2 ORDER BY COLUMN_ID",
+                        "SELECT C.COLUMN_NAME, C.DATA_TYPE, C.NULLABLE, C.COLUMN_ID, C.DATA_LENGTH, C.DATA_PRECISION, C.DATA_SCALE, CC.COMMENTS \
+                         FROM ALL_TAB_COLUMNS C LEFT JOIN ALL_COL_COMMENTS CC \
+                         ON CC.OWNER = C.OWNER AND CC.TABLE_NAME = C.TABLE_NAME AND CC.COLUMN_NAME = C.COLUMN_NAME \
+                         WHERE C.OWNER = :1 AND C.TABLE_NAME = :2 ORDER BY C.COLUMN_ID",
                         &[Value::String(owner.clone()), Value::String(table.clone())],
                     )
                     .await
@@ -403,19 +415,93 @@ impl Connector for OracleConnector {
                         ]);
                         field.insert("precision".into(), integer_cell(row, 5)?);
                         field.insert("scale".into(), integer_cell(row, 6)?);
+                        field.insert(
+                            "comment".into(),
+                            optional_string_cell(row, 7)?
+                                .map_or(DbValue::Null, DbValue::String),
+                        );
                         Ok(field)
                     })
                     .collect::<Result<Vec<_>>>()?;
+
+                let table_comment = query_optional_catalog_string(
+                    &connection,
+                    "SELECT COMMENTS FROM ALL_TAB_COMMENTS WHERE OWNER = :1 AND TABLE_NAME = :2",
+                    &owner,
+                    &table,
+                )
+                .await?;
+                let constraint_rows = query_catalog_rows(
+                    &connection,
+                    "SELECT C.CONSTRAINT_NAME, C.CONSTRAINT_TYPE, CC.COLUMN_NAME, CC.POSITION, \
+                            R.OWNER, R.TABLE_NAME, RCC.COLUMN_NAME \
+                     FROM ALL_CONSTRAINTS C \
+                     JOIN ALL_CONS_COLUMNS CC ON CC.OWNER = C.OWNER \
+                          AND CC.CONSTRAINT_NAME = C.CONSTRAINT_NAME \
+                     LEFT JOIN ALL_CONSTRAINTS R ON C.CONSTRAINT_TYPE = 'R' \
+                          AND R.OWNER = C.R_OWNER AND R.CONSTRAINT_NAME = C.R_CONSTRAINT_NAME \
+                     LEFT JOIN ALL_CONS_COLUMNS RCC ON RCC.OWNER = R.OWNER \
+                          AND RCC.CONSTRAINT_NAME = R.CONSTRAINT_NAME AND RCC.POSITION = CC.POSITION \
+                     WHERE C.OWNER = :1 AND C.TABLE_NAME = :2 \
+                          AND C.CONSTRAINT_TYPE IN ('P', 'U', 'R') \
+                     ORDER BY C.CONSTRAINT_NAME, CC.POSITION",
+                    &owner,
+                    &table,
+                    10_000,
+                )
+                .await?;
+                let constraints = constraint_rows
+                    .iter()
+                    .map(|row| {
+                        Ok(OracleConstraintRow {
+                            name: string_cell(row, 0)?,
+                            kind: string_cell(row, 1)?,
+                            column: string_cell(row, 2)?,
+                            position: unsigned_cell(row, 3)?,
+                            referenced_owner: optional_string_cell(row, 4)?,
+                            referenced_table: optional_string_cell(row, 5)?,
+                            referenced_column: optional_string_cell(row, 6)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let index_rows = query_catalog_rows(
+                    &connection,
+                    "SELECT I.INDEX_NAME, IC.COLUMN_NAME, IC.COLUMN_POSITION, I.UNIQUENESS \
+                     FROM ALL_INDEXES I JOIN ALL_IND_COLUMNS IC \
+                     ON IC.INDEX_OWNER = I.OWNER AND IC.INDEX_NAME = I.INDEX_NAME \
+                     WHERE I.TABLE_OWNER = :1 AND I.TABLE_NAME = :2 \
+                     ORDER BY I.INDEX_NAME, IC.COLUMN_POSITION",
+                    &owner,
+                    &table,
+                    10_000,
+                )
+                .await?;
+                let indexes = index_rows
+                    .iter()
+                    .map(|row| {
+                        Ok(OracleIndexRow {
+                            name: string_cell(row, 0)?,
+                            column: string_cell(row, 1)?,
+                            position: unsigned_cell(row, 2)?,
+                            unique: string_cell(row, 3)? == "UNIQUE",
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let mut metadata = build_oracle_relational_metadata(constraints, indexes)?
+                    .into_record();
+                metadata.insert("owner".into(), DbValue::String(owner.clone()));
                 Ok(EntityDescription {
                     entity: CatalogEntity {
                         id: format!("{owner}.{table}"),
                         namespace: Some(owner.clone()),
                         name: table,
                         kind: "table_or_view".into(),
-                        comment: None,
+                        comment: table_comment,
                     },
                     fields,
-                    metadata: BTreeMap::from([("owner".into(), DbValue::String(owner))]),
+                    metadata,
+                    truncated: false,
+                    warnings: Vec::new(),
                 })
             })
             .await
@@ -680,25 +766,16 @@ async fn query_built(
     let row_limit = built.row_limit.unwrap_or(context.max_rows as usize);
     let (columns, rows, driver_truncated) =
         collect_rows(connection, result, row_limit.saturating_add(1)).await?;
-    let mut records = rows_to_records(connection, &columns, &rows).await?;
-    let size_truncated = truncate_records(&mut records, row_limit, context.max_bytes)?;
-    let truncated = driver_truncated || size_truncated;
-    let next_cursor = if truncated {
-        built
-            .base_offset
-            .map(|offset| offset.saturating_add(records.len() as u64))
-            .map(encode_offset)
-            .transpose()?
-    } else {
-        None
-    };
-    Ok(read_result(
-        context,
-        started,
-        records,
-        truncated,
-        next_cursor,
-    ))
+    let records = rows_to_records(connection, &columns, &rows).await?;
+    let mut result = read_result(context, started, records, false, None);
+    truncate_records(
+        &mut result,
+        row_limit,
+        context.max_bytes,
+        driver_truncated,
+        built.base_offset,
+    )?;
+    Ok(result)
 }
 
 async fn native_query(
@@ -1100,6 +1177,223 @@ fn string_cell(row: &Row, index: usize) -> Result<String> {
     }
 }
 
+fn optional_string_cell(row: &Row, index: usize) -> Result<Option<String>> {
+    match row.get(index) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(Value::Number(value)) => Ok(Some(value.as_str().to_owned())),
+        Some(Value::Integer(value)) => Ok(Some(value.to_string())),
+        Some(value) => Ok(Some(value.to_string())),
+        None => Err(ConnectorError::new(
+            ErrorCategory::Protocol,
+            "Oracle row is incomplete",
+        )),
+    }
+}
+
+fn unsigned_cell(row: &Row, index: usize) -> Result<u64> {
+    match row.get(index) {
+        Some(Value::Integer(value)) => u64::try_from(*value).map_err(|_| {
+            ConnectorError::new(
+                ErrorCategory::Protocol,
+                "Oracle catalog returned a negative ordinal",
+            )
+        }),
+        Some(Value::Number(value)) => value.as_str().parse().map_err(|_| {
+            ConnectorError::new(
+                ErrorCategory::Protocol,
+                "Oracle catalog returned a non-numeric ordinal",
+            )
+        }),
+        Some(Value::String(value)) => value.parse().map_err(|_| {
+            ConnectorError::new(
+                ErrorCategory::Protocol,
+                "Oracle catalog returned a non-numeric ordinal",
+            )
+        }),
+        Some(_) => Err(ConnectorError::new(
+            ErrorCategory::Protocol,
+            "Oracle catalog returned a non-numeric ordinal",
+        )),
+        None => Err(ConnectorError::new(
+            ErrorCategory::Protocol,
+            "Oracle row is incomplete",
+        )),
+    }
+}
+
+async fn query_catalog_rows(
+    connection: &Connection,
+    sql: &str,
+    owner: &str,
+    table: &str,
+    limit: usize,
+) -> Result<Vec<Row>> {
+    let result = connection
+        .query(
+            sql,
+            &[
+                Value::String(owner.to_owned()),
+                Value::String(table.to_owned()),
+            ],
+        )
+        .await
+        .map_err(|error| map_oracle_error(&error, false))?;
+    let (_, rows, truncated) = collect_rows(connection, result, limit).await?;
+    if truncated {
+        return Err(ConnectorError::new(
+            ErrorCategory::InvalidRequest,
+            "Oracle relationship metadata exceeds the supported row limit",
+        ));
+    }
+    Ok(rows)
+}
+
+async fn query_optional_catalog_string(
+    connection: &Connection,
+    sql: &str,
+    owner: &str,
+    table: &str,
+) -> Result<Option<String>> {
+    let rows = query_catalog_rows(connection, sql, owner, table, 1).await?;
+    rows.first()
+        .map_or(Ok(None), |row| optional_string_cell(row, 0))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OracleConstraintRow {
+    name: String,
+    kind: String,
+    column: String,
+    position: u64,
+    referenced_owner: Option<String>,
+    referenced_table: Option<String>,
+    referenced_column: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OracleIndexRow {
+    name: String,
+    column: String,
+    position: u64,
+    unique: bool,
+}
+
+fn build_oracle_relational_metadata(
+    constraints: Vec<OracleConstraintRow>,
+    indexes: Vec<OracleIndexRow>,
+) -> Result<RelationalMetadata> {
+    let mut primary_keys = BTreeMap::<String, Vec<(u64, String)>>::new();
+    let mut unique_constraints = BTreeMap::<String, Vec<(u64, String)>>::new();
+    let mut foreign_keys = BTreeMap::<String, OracleForeignKeyAccumulator>::new();
+    for constraint in constraints {
+        match constraint.kind.as_str() {
+            "P" => primary_keys
+                .entry(constraint.name)
+                .or_default()
+                .push((constraint.position, constraint.column)),
+            "U" => unique_constraints
+                .entry(constraint.name)
+                .or_default()
+                .push((constraint.position, constraint.column)),
+            "R" => {
+                let referenced_owner = constraint.referenced_owner.ok_or_else(|| {
+                    ConnectorError::new(
+                        ErrorCategory::Protocol,
+                        "Oracle foreign key is missing its referenced owner",
+                    )
+                })?;
+                let referenced_table = constraint.referenced_table.ok_or_else(|| {
+                    ConnectorError::new(
+                        ErrorCategory::Protocol,
+                        "Oracle foreign key is missing its referenced table",
+                    )
+                })?;
+                let referenced_column = constraint.referenced_column.ok_or_else(|| {
+                    ConnectorError::new(
+                        ErrorCategory::Protocol,
+                        "Oracle foreign key is missing a referenced column",
+                    )
+                })?;
+                let entry = foreign_keys.entry(constraint.name).or_insert_with(|| {
+                    OracleForeignKeyAccumulator {
+                        referenced_entity: format!("{referenced_owner}.{referenced_table}"),
+                        columns: Vec::new(),
+                        referenced_columns: Vec::new(),
+                    }
+                });
+                entry.columns.push((constraint.position, constraint.column));
+                entry
+                    .referenced_columns
+                    .push((constraint.position, referenced_column));
+            }
+            _ => {}
+        }
+    }
+    if primary_keys.len() > 1 {
+        return Err(ConnectorError::new(
+            ErrorCategory::Protocol,
+            "Oracle returned multiple primary-key constraints for one entity",
+        ));
+    }
+    let primary_key = primary_keys
+        .into_iter()
+        .next()
+        .map(|(name, columns)| NamedColumns {
+            name,
+            columns: ordered_columns(columns),
+        });
+    let unique_constraints = unique_constraints
+        .into_iter()
+        .map(|(name, columns)| NamedColumns {
+            name,
+            columns: ordered_columns(columns),
+        })
+        .collect();
+    let foreign_keys = foreign_keys
+        .into_iter()
+        .map(|(name, key)| ForeignKeyMetadata {
+            name,
+            columns: ordered_columns(key.columns),
+            referenced_entity: key.referenced_entity,
+            referenced_columns: ordered_columns(key.referenced_columns),
+        })
+        .collect();
+    let mut grouped_indexes = BTreeMap::<String, (bool, Vec<(u64, String)>)>::new();
+    for index in indexes {
+        let entry = grouped_indexes
+            .entry(index.name)
+            .or_insert_with(|| (index.unique, Vec::new()));
+        entry.1.push((index.position, index.column));
+    }
+    let indexes = grouped_indexes
+        .into_iter()
+        .map(|(name, (unique, columns))| IndexMetadata {
+            name,
+            columns: ordered_columns(columns),
+            unique,
+        })
+        .collect();
+    Ok(RelationalMetadata {
+        primary_key,
+        foreign_keys,
+        unique_constraints,
+        indexes,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OracleForeignKeyAccumulator {
+    referenced_entity: String,
+    columns: Vec<(u64, String)>,
+    referenced_columns: Vec<(u64, String)>,
+}
+
+fn ordered_columns(mut columns: Vec<(u64, String)>) -> Vec<String> {
+    columns.sort_by_key(|(position, _)| *position);
+    columns.into_iter().map(|(_, column)| column).collect()
+}
+
 fn integer_cell(row: &Row, index: usize) -> Result<DbValue> {
     Ok(match row.get(index) {
         Some(Value::Null) => DbValue::Null,
@@ -1242,7 +1536,10 @@ mod tests {
     };
     use url::Url;
 
-    use super::{OracleConnector, build_config};
+    use super::{
+        OracleConnector, OracleConstraintRow, OracleIndexRow, build_config,
+        build_oracle_relational_metadata,
+    };
 
     fn profile() -> ConnectionProfile {
         let tls = TlsConfig {
@@ -1288,5 +1585,68 @@ mod tests {
         assert_eq!(config.host, "localhost");
         assert_eq!(config.port, 1_521);
         assert_eq!(config.username, "system");
+    }
+
+    #[test]
+    fn relationship_metadata_preserves_composite_key_order() {
+        let constraints = vec![
+            OracleConstraintRow {
+                name: "CHILD_PK".into(),
+                kind: "P".into(),
+                column: "B".into(),
+                position: 2,
+                referenced_owner: None,
+                referenced_table: None,
+                referenced_column: None,
+            },
+            OracleConstraintRow {
+                name: "CHILD_PK".into(),
+                kind: "P".into(),
+                column: "A".into(),
+                position: 1,
+                referenced_owner: None,
+                referenced_table: None,
+                referenced_column: None,
+            },
+            OracleConstraintRow {
+                name: "CHILD_PARENT_FK".into(),
+                kind: "R".into(),
+                column: "PARENT_B".into(),
+                position: 2,
+                referenced_owner: Some("APP".into()),
+                referenced_table: Some("PARENT".into()),
+                referenced_column: Some("B".into()),
+            },
+            OracleConstraintRow {
+                name: "CHILD_PARENT_FK".into(),
+                kind: "R".into(),
+                column: "PARENT_A".into(),
+                position: 1,
+                referenced_owner: Some("APP".into()),
+                referenced_table: Some("PARENT".into()),
+                referenced_column: Some("A".into()),
+            },
+        ];
+        let metadata = build_oracle_relational_metadata(
+            constraints,
+            vec![OracleIndexRow {
+                name: "CHILD_LOOKUP".into(),
+                column: "PARENT_A".into(),
+                position: 1,
+                unique: false,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            metadata.primary_key.unwrap().columns,
+            vec!["A".to_owned(), "B".to_owned()]
+        );
+        assert_eq!(metadata.foreign_keys[0].referenced_entity, "APP.PARENT");
+        assert_eq!(
+            metadata.foreign_keys[0].referenced_columns,
+            vec!["A".to_owned(), "B".to_owned()]
+        );
+        assert_eq!(metadata.indexes[0].columns, vec!["PARENT_A"]);
     }
 }

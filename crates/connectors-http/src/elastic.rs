@@ -314,6 +314,8 @@ impl ElasticAdapter {
                     ),
                 ),
             ]),
+            truncated: false,
+            warnings: Vec::new(),
         })
     }
 

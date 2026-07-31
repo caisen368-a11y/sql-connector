@@ -22,6 +22,7 @@ fn exposes_discovery_and_all_data_model_tool_families() {
     for expected in [
         "db_list_connections",
         "db_get_capabilities",
+        "db_inspect_schema",
         "sql_read",
         "document_find",
         "kv_read",
@@ -40,6 +41,13 @@ fn exposes_discovery_and_all_data_model_tool_families() {
             .iter()
             .all(|tool| tool.input_schema.contains_key("type"))
     );
+
+    let inspect = tools
+        .iter()
+        .find(|tool| tool.name == "db_inspect_schema")
+        .unwrap();
+    assert_eq!(inspect.input_schema["properties"]["limit"]["default"], 10);
+    assert_eq!(inspect.input_schema["properties"]["limit"]["maximum"], 20);
 }
 
 #[test]

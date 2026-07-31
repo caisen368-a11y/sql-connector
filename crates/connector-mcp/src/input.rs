@@ -32,6 +32,24 @@ fn default_catalog_limit() -> u32 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SchemaInspectInput {
+    pub connection_id: String,
+    /// Optional client-generated id accepted by `db_cancel` while this call is running.
+    pub request_id: Option<String>,
+    pub pattern: Option<String>,
+    pub namespace: Option<String>,
+    /// Number of catalog entities to describe. Defaults to 10 and is capped at 20.
+    #[serde(default = "default_schema_inspect_limit")]
+    #[schemars(range(min = 1, max = 20))]
+    pub limit: u32,
+    pub cursor: Option<String>,
+}
+
+fn default_schema_inspect_limit() -> u32 {
+    10
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EntityInput {
     pub connection_id: String,
     /// Optional client-generated id accepted by `db_cancel` while this call is running.

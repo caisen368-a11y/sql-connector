@@ -85,6 +85,10 @@ pub struct EntityDescription {
     pub fields: Vec<DbRecord>,
     #[serde(default)]
     pub metadata: DbRecord,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Database adapter contract. Each product/mode has a distinct implementation or wrapper.

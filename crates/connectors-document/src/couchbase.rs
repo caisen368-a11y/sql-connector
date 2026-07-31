@@ -490,6 +490,8 @@ async fn describe_collection(
             ("max_expiry".into(), max_expiry),
             ("history".into(), DbValue::Bool(collection_spec.history())),
         ]),
+        truncated: false,
+        warnings: Vec::new(),
     })
 }
 

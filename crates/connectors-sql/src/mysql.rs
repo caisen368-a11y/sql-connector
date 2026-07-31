@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    error::Error as StdError,
     str::FromStr as _,
     time::{Duration, Instant},
 };
@@ -29,7 +30,12 @@ use crate::{
         effective_write_limit, invalid, parse_native, required_secret, truncate_records,
         unsupported, validate_auth, validate_tls,
     },
+    relational_metadata::{ForeignKeyMetadata, IndexMetadata, NamedColumns, RelationalMetadata},
 };
+
+type ConstraintColumnRow = (String, String, String, u64);
+type ForeignKeyColumnRow = (String, String, String, String, String, u64);
+type IndexColumnRow = (String, u64, Option<String>, u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MySqlFlavor {
@@ -318,12 +324,17 @@ impl Connector for MySqlConnector {
                 let pattern = query.pattern.map(|value| format!("%{value}%"));
                 let rows: Vec<(String, String, String)> = connection
                     .exec(
-                        "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.tables \
-                         WHERE (? IS NULL OR TABLE_SCHEMA = ?) AND (? IS NULL OR TABLE_NAME LIKE ?) \
-                         ORDER BY TABLE_SCHEMA, TABLE_NAME LIMIT ? OFFSET ?",
+                        "SELECT T.TABLE_SCHEMA, T.TABLE_NAME, T.TABLE_TYPE FROM information_schema.tables AS T \
+                         WHERE (? IS NULL OR T.TABLE_SCHEMA = ?) \
+                         AND (? IS NULL OR T.TABLE_NAME LIKE ? \
+                              OR EXISTS (SELECT 1 FROM information_schema.columns AS C \
+                                         WHERE C.TABLE_SCHEMA = T.TABLE_SCHEMA \
+                                         AND C.TABLE_NAME = T.TABLE_NAME AND C.COLUMN_NAME LIKE ?)) \
+                         ORDER BY T.TABLE_SCHEMA, T.TABLE_NAME LIMIT ? OFFSET ?",
                         Params::Positional(vec![
                             option_string_value(namespace.as_deref()),
                             option_string_value(namespace.as_deref()),
+                            option_string_value(pattern.as_deref()),
                             option_string_value(pattern.as_deref()),
                             option_string_value(pattern.as_deref()),
                             Value::UInt(u64::from(limit)),
@@ -381,9 +392,23 @@ impl Connector for MySqlConnector {
             .run(&context, false, async move {
                 let timeout = effective_timeout(&task_context, &profile, None)?;
                 let mut connection = connect(&pools, &profile, &secret, timeout).await?;
-                let rows: Vec<(String, String, String, u64)> = connection
+                let table_info: Option<(String, Option<String>)> = connection
+                    .exec_first(
+                        "SELECT TABLE_TYPE, TABLE_COMMENT FROM information_schema.tables \
+                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                        Params::Positional(vec![
+                            Value::Bytes(database.as_bytes().to_vec()),
+                            Value::Bytes(table.as_bytes().to_vec()),
+                        ]),
+                    )
+                    .await
+                    .map_err(|error| map_mysql_error(&error, false))?;
+                let (kind, table_comment) = table_info.ok_or_else(|| {
+                    ConnectorError::new(ErrorCategory::NotFound, "SQL entity was not found")
+                })?;
+                let rows: Vec<(String, String, String, u64, Option<String>)> = connection
                     .exec(
-                        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, ORDINAL_POSITION \
+                        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, ORDINAL_POSITION, COLUMN_COMMENT \
                          FROM information_schema.columns \
                          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
                         Params::Positional(vec![
@@ -393,33 +418,88 @@ impl Connector for MySqlConnector {
                     )
                     .await
                     .map_err(|error| map_mysql_error(&error, false))?;
-                if rows.is_empty() {
-                    return Err(ConnectorError::new(
-                        ErrorCategory::NotFound,
-                        "SQL entity was not found",
-                    ));
-                }
                 let fields = rows
                     .into_iter()
-                    .map(|(name, data_type, nullable, ordinal)| {
+                    .map(|(name, data_type, nullable, ordinal, comment)| {
                         BTreeMap::from([
                             ("name".into(), DbValue::String(name)),
                             ("type".into(), DbValue::String(data_type)),
                             ("nullable".into(), DbValue::Bool(nullable == "YES")),
                             ("ordinal".into(), DbValue::UInt64(ordinal)),
+                            (
+                                "comment".into(),
+                                comment
+                                    .filter(|value| !value.is_empty())
+                                    .map_or(DbValue::Null, DbValue::String),
+                            ),
                         ])
                     })
                     .collect();
+                let constraint_rows: Vec<ConstraintColumnRow> = connection
+                    .exec(
+                        "SELECT TC.CONSTRAINT_NAME, TC.CONSTRAINT_TYPE, KCU.COLUMN_NAME, KCU.ORDINAL_POSITION \
+                         FROM information_schema.table_constraints AS TC \
+                         INNER JOIN information_schema.key_column_usage AS KCU \
+                           ON KCU.CONSTRAINT_SCHEMA = TC.CONSTRAINT_SCHEMA \
+                          AND KCU.TABLE_SCHEMA = TC.TABLE_SCHEMA \
+                          AND KCU.TABLE_NAME = TC.TABLE_NAME \
+                          AND KCU.CONSTRAINT_NAME = TC.CONSTRAINT_NAME \
+                         WHERE TC.TABLE_SCHEMA = ? AND TC.TABLE_NAME = ? \
+                           AND TC.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE') \
+                         ORDER BY TC.CONSTRAINT_TYPE, TC.CONSTRAINT_NAME, KCU.ORDINAL_POSITION",
+                        Params::Positional(vec![
+                            Value::Bytes(database.as_bytes().to_vec()),
+                            Value::Bytes(table.as_bytes().to_vec()),
+                        ]),
+                    )
+                    .await
+                    .map_err(|error| map_mysql_error(&error, false))?;
+                let foreign_key_rows: Vec<ForeignKeyColumnRow> = connection
+                    .exec(
+                        "SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_SCHEMA, \
+                                REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, ORDINAL_POSITION \
+                         FROM information_schema.key_column_usage \
+                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+                           AND REFERENCED_TABLE_NAME IS NOT NULL \
+                         ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION",
+                        Params::Positional(vec![
+                            Value::Bytes(database.as_bytes().to_vec()),
+                            Value::Bytes(table.as_bytes().to_vec()),
+                        ]),
+                    )
+                    .await
+                    .map_err(|error| map_mysql_error(&error, false))?;
+                let index_rows: Vec<IndexColumnRow> = connection
+                    .exec(
+                        "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME, SEQ_IN_INDEX \
+                         FROM information_schema.statistics \
+                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+                         ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+                        Params::Positional(vec![
+                            Value::Bytes(database.as_bytes().to_vec()),
+                            Value::Bytes(table.as_bytes().to_vec()),
+                        ]),
+                    )
+                    .await
+                    .map_err(|error| map_mysql_error(&error, false))?;
+                let metadata = assemble_mysql_metadata(
+                    constraint_rows,
+                    foreign_key_rows,
+                    index_rows,
+                )
+                .into_record();
                 Ok(EntityDescription {
                     entity: CatalogEntity {
                         id: format!("{database}.{table}"),
                         namespace: Some(database),
                         name: table,
-                        kind: "table_or_view".into(),
-                        comment: None,
+                        kind: kind.to_ascii_lowercase(),
+                        comment: table_comment.filter(|value| !value.is_empty()),
                     },
                     fields,
-                    metadata: BTreeMap::new(),
+                    metadata,
+                    truncated: false,
+                    warnings: Vec::new(),
                 })
             })
             .await
@@ -466,6 +546,100 @@ impl Connector for MySqlConnector {
     async fn cancel(&self, request_id: &str) -> Result<()> {
         self.cancellation.cancel(request_id).await
     }
+}
+
+fn assemble_mysql_metadata(
+    constraint_rows: Vec<ConstraintColumnRow>,
+    foreign_key_rows: Vec<ForeignKeyColumnRow>,
+    index_rows: Vec<IndexColumnRow>,
+) -> RelationalMetadata {
+    let mut primary_keys = BTreeMap::<String, Vec<(u64, String)>>::new();
+    let mut unique_constraints = BTreeMap::<String, Vec<(u64, String)>>::new();
+    for (name, constraint_type, column, ordinal) in constraint_rows {
+        let target = if constraint_type == "PRIMARY KEY" {
+            &mut primary_keys
+        } else {
+            &mut unique_constraints
+        };
+        target.entry(name).or_default().push((ordinal, column));
+    }
+
+    let primary_key = primary_keys
+        .into_iter()
+        .next()
+        .map(|(name, columns)| NamedColumns {
+            name,
+            columns: ordered_columns(columns),
+        });
+    let unique_constraints = unique_constraints
+        .into_iter()
+        .map(|(name, columns)| NamedColumns {
+            name,
+            columns: ordered_columns(columns),
+        })
+        .collect();
+
+    let mut foreign_key_columns =
+        BTreeMap::<(String, String, String), Vec<(u64, String, String)>>::new();
+    for (name, column, referenced_schema, referenced_table, referenced_column, ordinal) in
+        foreign_key_rows
+    {
+        foreign_key_columns
+            .entry((name, referenced_schema, referenced_table))
+            .or_default()
+            .push((ordinal, column, referenced_column));
+    }
+    let foreign_keys = foreign_key_columns
+        .into_iter()
+        .map(
+            |((name, referenced_schema, referenced_table), mut columns)| {
+                columns.sort_by_key(|(ordinal, _, _)| *ordinal);
+                ForeignKeyMetadata {
+                    name,
+                    columns: columns
+                        .iter()
+                        .map(|(_, column, _)| column.clone())
+                        .collect(),
+                    referenced_entity: format!("{referenced_schema}.{referenced_table}"),
+                    referenced_columns: columns
+                        .into_iter()
+                        .map(|(_, _, referenced_column)| referenced_column)
+                        .collect(),
+                }
+            },
+        )
+        .collect();
+
+    let mut index_columns = BTreeMap::<String, (bool, Vec<(u64, String)>)>::new();
+    for (name, non_unique, column, ordinal) in index_rows {
+        let index = index_columns
+            .entry(name)
+            .or_insert_with(|| (non_unique == 0, Vec::new()));
+        index.0 &= non_unique == 0;
+        if let Some(column) = column {
+            index.1.push((ordinal, column));
+        }
+    }
+    let indexes = index_columns
+        .into_iter()
+        .map(|(name, (unique, columns))| IndexMetadata {
+            name,
+            columns: ordered_columns(columns),
+            unique,
+        })
+        .collect();
+
+    RelationalMetadata {
+        primary_key,
+        foreign_keys,
+        unique_constraints,
+        indexes,
+    }
+}
+
+fn ordered_columns(mut columns: Vec<(u64, String)>) -> Vec<String> {
+    columns.sort_by_key(|(ordinal, _)| *ordinal);
+    columns.into_iter().map(|(_, column)| column).collect()
 }
 
 fn flavor_name(flavor: MySqlFlavor) -> &'static str {
@@ -532,6 +706,7 @@ fn split_mysql_entity(entity_id: &str, default_database: Option<&str>) -> Result
 }
 
 fn build_options(profile: &ConnectionProfile, secret: &SecretMaterial) -> Result<Opts> {
+    ensure_mysql_crypto_provider();
     let builder = match secret.kind {
         AuthKind::ConnectionString => {
             let opts = Opts::from_url(required_secret(secret, "connection_string")?)
@@ -613,6 +788,13 @@ fn build_options(profile: &ConnectionProfile, secret: &SecretMaterial) -> Result
         .with_inactive_connection_ttl(CONNECTION_IDLE);
     let builder = builder.pool_opts(pool_options);
     Ok(Opts::from(builder))
+}
+
+fn ensure_mysql_crypto_provider() {
+    // Workspace feature unification can enable multiple providers; MySQL's TLS feature uses ring.
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
 }
 
 fn validate_connection_string_target(profile: &ConnectionProfile, opts: &Opts) -> Result<()> {
@@ -730,23 +912,15 @@ where
             records.push(mysql_row_to_record(&row)?);
         }
     }
-    let truncated = truncate_records(&mut records, row_limit, context.max_bytes)?;
-    let next_cursor = if truncated {
-        built
-            .base_offset
-            .map(|offset| offset.saturating_add(records.len() as u64))
-            .map(crate::common::encode_offset)
-            .transpose()?
-    } else {
-        None
-    };
-    Ok(read_result(
-        context,
-        started,
-        records,
-        truncated,
-        next_cursor,
-    ))
+    let mut result = read_result(context, started, records, false, None);
+    truncate_records(
+        &mut result,
+        row_limit,
+        context.max_bytes,
+        false,
+        built.base_offset,
+    )?;
+    Ok(result)
 }
 
 async fn native_query(
@@ -1118,7 +1292,18 @@ fn map_mysql_error(error: &MySqlError, write: bool) -> ConnectorError {
         .with_code(server.code.to_string())
         .retryable(matches!(server.code, 1040 | 1053 | 1205 | 1213));
     }
-    let mut mapped = ConnectorError::new(
+    if mysql_error_is_tls(error) {
+        return ConnectorError::new(
+            if write {
+                ErrorCategory::UnknownOutcome
+            } else {
+                ErrorCategory::Unavailable
+            },
+            "MySQL TLS handshake failed",
+        )
+        .with_phase(ErrorPhase::Tls);
+    }
+    ConnectorError::new(
         if write && error.is_fatal() {
             ErrorCategory::UnknownOutcome
         } else if error.is_fatal() {
@@ -1128,30 +1313,45 @@ fn map_mysql_error(error: &MySqlError, write: bool) -> ConnectorError {
         },
         "MySQL driver could not complete the request",
     )
-    .retryable(!write && error.is_fatal());
-    if matches!(
-        error,
+    .retryable(!write && error.is_fatal())
+}
+
+fn mysql_error_is_tls(error: &MySqlError) -> bool {
+    match error {
         MySqlError::Io(IoError::Tls(_))
-            | MySqlError::Driver(DriverError::NoClientSslFlagFromServer)
-    ) {
-        mapped = mapped.with_phase(ErrorPhase::Tls);
+        | MySqlError::Driver(DriverError::NoClientSslFlagFromServer) => true,
+        MySqlError::Io(IoError::Io(error)) => error
+            .get_ref()
+            .is_some_and(|source| error_chain_includes_rustls(source)),
+        _ => false,
     }
-    mapped
+}
+
+fn error_chain_includes_rustls(error: &(dyn StdError + 'static)) -> bool {
+    if error.is::<rustls::Error>() {
+        return true;
+    }
+    error.source().is_some_and(error_chain_includes_rustls)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        env,
+        time::{Duration, Instant},
+    };
 
     use connector_core::{
-        AuthKind, ConnectionId, ConnectionPolicy, ConnectionProfile, Connector, ErrorCategory,
-        ErrorPhase, Product, SecretMaterial, TlsConfig,
+        AuthKind, ConnectionId, ConnectionPolicy, ConnectionProfile, Connector, ConnectorContext,
+        DbValue, ErrorCategory, ErrorPhase, Product, SecretMaterial, TlsConfig,
     };
-    use mysql_async::{DriverError, Error as MySqlError};
+    use mysql_async::{DriverError, Error as MySqlError, IoError};
     use url::Url;
 
     use super::{
-        MySqlConnector, MySqlFlavor, build_options, map_mysql_error, verify_server_flavor,
+        MySqlConnector, MySqlFlavor, assemble_mysql_metadata, build_options, map_mysql_error,
+        verify_server_flavor,
     };
 
     fn profile() -> ConnectionProfile {
@@ -1188,11 +1388,185 @@ mod tests {
     }
 
     #[test]
+    fn metadata_rows_group_composite_keys_and_indexes_in_ordinal_order() {
+        let metadata = assemble_mysql_metadata(
+            vec![
+                (
+                    "PRIMARY".into(),
+                    "PRIMARY KEY".into(),
+                    "tenant_id".into(),
+                    2,
+                ),
+                ("PRIMARY".into(), "PRIMARY KEY".into(), "id".into(), 1),
+                ("uq_email".into(), "UNIQUE".into(), "email".into(), 1),
+            ],
+            vec![
+                (
+                    "fk_order_customer".into(),
+                    "customer_region".into(),
+                    "crm".into(),
+                    "customers".into(),
+                    "region".into(),
+                    2,
+                ),
+                (
+                    "fk_order_customer".into(),
+                    "customer_id".into(),
+                    "crm".into(),
+                    "customers".into(),
+                    "id".into(),
+                    1,
+                ),
+            ],
+            vec![
+                ("idx_status_created".into(), 1, Some("created_at".into()), 2),
+                ("idx_status_created".into(), 1, Some("status".into()), 1),
+                ("uq_email".into(), 0, Some("email".into()), 1),
+            ],
+        );
+
+        assert_eq!(metadata.primary_key.unwrap().columns, ["id", "tenant_id"]);
+        assert_eq!(metadata.unique_constraints[0].columns, ["email"]);
+        assert_eq!(
+            metadata.foreign_keys[0].columns,
+            ["customer_id", "customer_region"]
+        );
+        assert_eq!(metadata.foreign_keys[0].referenced_entity, "crm.customers");
+        assert_eq!(
+            metadata.foreign_keys[0].referenced_columns,
+            ["id", "region"]
+        );
+        assert_eq!(metadata.indexes[0].columns, ["status", "created_at"]);
+        assert!(!metadata.indexes[0].unique);
+        assert!(metadata.indexes[1].unique);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SQL_CONNECTOR_MYSQL_METADATA_E2E_* environment variables"]
+    async fn live_describe_entity_returns_comments_keys_and_indexes() {
+        let endpoint = env::var("SQL_CONNECTOR_MYSQL_METADATA_E2E_ENDPOINT").unwrap();
+        let database = env::var("SQL_CONNECTOR_MYSQL_METADATA_E2E_DATABASE").unwrap();
+        let username = env::var("SQL_CONNECTOR_MYSQL_METADATA_E2E_USERNAME").unwrap();
+        let password = env::var("SQL_CONNECTOR_MYSQL_METADATA_E2E_PASSWORD").unwrap();
+        let mut profile = profile();
+        profile.endpoint = Url::parse(&endpoint).unwrap();
+        profile.database = Some(database.clone());
+        profile.auth_kind = AuthKind::UsernamePassword;
+        profile.secret_ref = "mysql-metadata-live-secret".into();
+        profile.tls.enabled = false;
+        let secret = SecretMaterial {
+            kind: AuthKind::UsernamePassword,
+            fields: BTreeMap::from([("username".into(), username), ("password".into(), password)]),
+        };
+        let context = ConnectorContext {
+            request_id: "mysql-metadata-live".into(),
+            session_id: "mysql-metadata-live".into(),
+            deadline: Instant::now() + Duration::from_secs(20),
+            max_rows: 100,
+            max_bytes: 256 * 1024,
+        };
+
+        let description = MySqlConnector::mysql()
+            .describe_entity(&context, &profile, &secret, &format!("{database}.child"))
+            .await
+            .unwrap();
+
+        assert_eq!(description.entity.kind, "base table");
+        assert_eq!(
+            description.entity.comment.as_deref(),
+            Some("child metadata table")
+        );
+        let child_id = description
+            .fields
+            .iter()
+            .find(|field| field["name"] == DbValue::String("child_id".into()))
+            .unwrap();
+        assert_eq!(
+            child_id["comment"],
+            DbValue::String("child identifier".into())
+        );
+
+        let metadata = serde_json::to_value(description.metadata).unwrap();
+        assert_eq!(
+            metadata["primary_key"]["value"]["columns"]["value"][0]["value"],
+            "tenant_id"
+        );
+        assert_eq!(
+            metadata["primary_key"]["value"]["columns"]["value"][1]["value"],
+            "child_id"
+        );
+        let unique = metadata["unique_constraints"]["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["value"]["name"]["value"] == "uq_child_code")
+            .unwrap();
+        assert_eq!(unique["value"]["columns"]["value"][1]["value"], "code");
+        let foreign_key = &metadata["foreign_keys"]["value"][0]["value"];
+        assert_eq!(foreign_key["name"]["value"], "fk_child_parent");
+        assert_eq!(
+            foreign_key["referenced_entity"]["value"],
+            format!("{database}.parent")
+        );
+        assert_eq!(foreign_key["columns"]["value"][1]["value"], "parent_id");
+        assert_eq!(
+            foreign_key["referenced_columns"]["value"][1]["value"],
+            "parent_id"
+        );
+        let index = metadata["indexes"]["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["value"]["name"]["value"] == "idx_child_status_created")
+            .unwrap();
+        assert_eq!(index["value"]["unique"]["value"], false);
+        assert_eq!(index["value"]["columns"]["value"][0]["value"], "status");
+        assert_eq!(index["value"]["columns"]["value"][1]["value"], "created_at");
+    }
+
+    #[test]
     fn tls_driver_error_has_tls_phase() {
         let error = MySqlError::Driver(DriverError::NoClientSslFlagFromServer);
         let mapped = map_mysql_error(&error, false);
 
+        assert_eq!(mapped.category, ErrorCategory::Unavailable);
         assert_eq!(mapped.phase, ErrorPhase::Tls);
+        assert_eq!(mapped.message, "MySQL TLS handshake failed");
+        assert!(!mapped.retryable);
+
+        let error = MySqlError::Io(IoError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::General("certificate rejected".into()),
+        )));
+        let mapped = map_mysql_error(&error, false);
+
+        assert_eq!(mapped.category, ErrorCategory::Unavailable);
+        assert_eq!(mapped.phase, ErrorPhase::Tls);
+        assert_eq!(mapped.message, "MySQL TLS handshake failed");
+        assert!(!mapped.retryable);
+    }
+
+    #[test]
+    fn building_mysql_options_installs_a_crypto_provider() {
+        let mut profile = profile();
+        profile.auth_kind = AuthKind::UsernamePassword;
+        let secret = SecretMaterial {
+            kind: AuthKind::UsernamePassword,
+            fields: BTreeMap::from([
+                ("username".into(), "mysql".into()),
+                ("password".into(), "password".into()),
+            ]),
+        };
+
+        build_options(&profile, &secret).unwrap();
+        let installed = rustls::crypto::CryptoProvider::get_default().unwrap();
+
+        build_options(&profile, &secret).unwrap();
+
+        assert!(std::ptr::eq(
+            installed,
+            rustls::crypto::CryptoProvider::get_default().unwrap()
+        ));
     }
 
     #[tokio::test]

@@ -238,6 +238,8 @@ impl MilvusRestConnector {
             },
             fields,
             metadata,
+            truncated: false,
+            warnings: Vec::new(),
         })
     }
 

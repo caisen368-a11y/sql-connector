@@ -32,7 +32,7 @@ impl Connector for FakeConnector {
             Capability::TimeSeriesQuery,
         ];
         if self.discover {
-            capabilities.push(Capability::Discover);
+            capabilities.extend([Capability::Discover, Capability::Describe]);
         }
         ConnectorManifest {
             id: "test-postgresql".into(),
@@ -108,9 +108,49 @@ impl Connector for FakeConnector {
         _context: &ConnectorContext,
         _profile: &ConnectionProfile,
         _secret: &SecretMaterial,
-        _entity_id: &str,
+        entity_id: &str,
     ) -> connector_core::Result<EntityDescription> {
-        unreachable!()
+        let foreign_key = |name: &str, referenced_entity: &str| {
+            DbValue::Document(DbRecord::from([
+                ("name".into(), DbValue::String(name.into())),
+                (
+                    "columns".into(),
+                    DbValue::Array(vec![DbValue::String("owner_id".into())]),
+                ),
+                (
+                    "referenced_entity".into(),
+                    DbValue::String(referenced_entity.into()),
+                ),
+                (
+                    "referenced_columns".into(),
+                    DbValue::Array(vec![DbValue::String("id".into())]),
+                ),
+            ]))
+        };
+        Ok(EntityDescription {
+            entity: CatalogEntity {
+                id: entity_id.into(),
+                namespace: entity_id
+                    .split_once('.')
+                    .map(|(namespace, _)| namespace.into()),
+                name: entity_id
+                    .rsplit_once('.')
+                    .map_or(entity_id, |(_, name)| name)
+                    .into(),
+                kind: "table".into(),
+                comment: None,
+            },
+            fields: vec![],
+            metadata: DbRecord::from([(
+                "foreign_keys".into(),
+                DbValue::Array(vec![
+                    foreign_key("orders_customer_fkey", "public.customers"),
+                    foreign_key("orders_owner_fkey", "private.users"),
+                ]),
+            )]),
+            truncated: false,
+            warnings: Vec::new(),
+        })
     }
 
     async fn execute(
@@ -428,6 +468,43 @@ async fn catalog_paging_skips_denied_pages_and_returns_visible_entities() {
         vec!["public.one", "public.two"]
     );
     assert!(page.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn descriptions_hide_foreign_keys_to_policy_denied_entities() {
+    let rule = |pattern: &str, allow_read| ResourceRule {
+        pattern: pattern.into(),
+        allow_read,
+        allow_insert: false,
+        allow_update: false,
+        allow_delete: false,
+        masked_fields: Vec::new(),
+    };
+    let (runtime, connection_id, _) = build_runtime_with(
+        true,
+        vec![
+            rule("public", true),
+            rule("private", true),
+            rule("private.users", false),
+        ],
+    );
+
+    let description = runtime
+        .describe_entity(connection_id, "user", "session", "public.orders")
+        .await
+        .unwrap();
+    let DbValue::Array(foreign_keys) = &description.metadata["foreign_keys"] else {
+        panic!("foreign_keys must be an array");
+    };
+
+    assert_eq!(foreign_keys.len(), 1);
+    let DbValue::Document(foreign_key) = &foreign_keys[0] else {
+        panic!("foreign key must be a document");
+    };
+    assert_eq!(
+        foreign_key["referenced_entity"],
+        DbValue::String("public.customers".into())
+    );
 }
 
 #[tokio::test]

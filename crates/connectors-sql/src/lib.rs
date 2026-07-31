@@ -5,6 +5,7 @@ mod common;
 mod mysql;
 mod oracle;
 mod postgres;
+mod relational_metadata;
 mod sql_server;
 
 pub use mysql::MySqlConnector;

@@ -826,6 +826,8 @@ impl Connector for MongoConnector {
                         "sampled_documents".into(),
                         DbValue::UInt64(sampled),
                     )]),
+                    truncated: false,
+                    warnings: Vec::new(),
                 })
             })
             .await

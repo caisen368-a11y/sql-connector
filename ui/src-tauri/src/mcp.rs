@@ -154,11 +154,15 @@ impl McpManager {
             .filter(|tool| allowed.contains(&tool.name.to_string()))
             .filter(|tool| !is_host_only_tool(tool.name.as_ref()))
             .map(|tool| {
+                let name = tool.name.into_owned();
                 let mut schema = Value::Object((*tool.input_schema).clone());
                 remove_host_arguments(&mut schema);
+                if name == "native_query" {
+                    remove_native_query_write_arguments(&mut schema);
+                }
                 Ok(ToolFunction {
                     kind: "function",
-                    name: tool.name.into_owned(),
+                    name,
                     description: tool
                         .description
                         .map_or_else(String::new, |value| value.into_owned()),
@@ -335,6 +339,31 @@ fn remove_host_arguments(schema: &mut Value) {
     }
 }
 
+fn remove_native_query_write_arguments(schema: &mut Value) {
+    match schema {
+        Value::Object(object) => {
+            if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+                properties.remove("max_affected");
+                properties.remove("idempotency_key");
+            }
+            if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
+                required.retain(|value| {
+                    !matches!(value.as_str(), Some("max_affected" | "idempotency_key"))
+                });
+            }
+            for value in object.values_mut() {
+                remove_native_query_write_arguments(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                remove_native_query_write_arguments(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn tool_target(arguments: &Value) -> Option<String> {
     arguments
         .get("request")
@@ -364,4 +393,47 @@ fn redact_line(line: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_query_schema_hides_write_only_arguments() {
+        let mut schema = json!({
+            "properties": {
+                "request": {
+                    "properties": {
+                        "statement": {"type": "string"},
+                        "max_affected": {"type": ["integer", "null"]},
+                        "idempotency_key": {"type": ["string", "null"]}
+                    },
+                    "required": ["statement", "max_affected", "idempotency_key"]
+                }
+            }
+        });
+
+        remove_native_query_write_arguments(&mut schema);
+
+        assert!(
+            schema
+                .pointer("/properties/request/properties/statement")
+                .is_some()
+        );
+        assert!(
+            schema
+                .pointer("/properties/request/properties/max_affected")
+                .is_none()
+        );
+        assert!(
+            schema
+                .pointer("/properties/request/properties/idempotency_key")
+                .is_none()
+        );
+        assert_eq!(
+            schema.pointer("/properties/request/required"),
+            Some(&json!(["statement"]))
+        );
+    }
 }

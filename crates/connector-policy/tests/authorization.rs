@@ -7,8 +7,8 @@ use connector_core::{
     VectorSearchRequest,
 };
 use connector_policy::{
-    AuthorizationClaims, GrantIssuer, GrantVerifier, PolicyDecision, PolicyEngine, PolicyError,
-    VerificationContext, canonical_arguments_hash,
+    Action, AuthorizationClaims, GrantIssuer, GrantVerifier, PolicyDecision, PolicyEngine,
+    PolicyError, VerificationContext, canonical_arguments_hash,
 };
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
@@ -70,6 +70,30 @@ fn native_read_cannot_smuggle_a_write_statement() {
         idempotency_key: None,
     });
     assert!(PolicyEngine::evaluate(&policy, &operation).is_err());
+}
+
+#[test]
+fn native_select_ignores_write_only_max_affected() {
+    let policy = ConnectionPolicy {
+        allow_native_read: true,
+        max_affected: 100,
+        ..ConnectionPolicy::default()
+    };
+    let operation = DataOperation::NativeQuery(NativeRequest {
+        language: "sql".into(),
+        statement: "SELECT table_schema, table_name, column_name FROM information_schema.columns"
+            .into(),
+        parameters: BTreeMap::new(),
+        positional_parameters: vec![],
+        max_affected: Some(500),
+        idempotency_key: None,
+    });
+
+    assert_eq!(PolicyEngine::classify(&operation), Action::NativeRead);
+    assert_eq!(
+        PolicyEngine::evaluate(&policy, &operation),
+        Ok(PolicyDecision::Allow)
+    );
 }
 
 #[test]

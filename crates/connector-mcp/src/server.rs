@@ -342,7 +342,7 @@ impl DatabaseMcpServer {
 
     #[tool(
         name = "native_query",
-        description = "Run a configured read-only native SQL, CQL, DSL, Flux, or equivalent query",
+        description = "Run a configured read-only native SQL, CQL, DSL, Flux, or equivalent query. Use this tool for SELECT, SHOW, or DESCRIBE and omit write-only max_affected and idempotency_key fields",
         annotations(
             title = "Run native read query",
             read_only_hint = true,
@@ -360,7 +360,7 @@ impl DatabaseMcpServer {
 
     #[tool(
         name = "native_execute",
-        description = "Run a high-privilege native write command after explicit confirmation",
+        description = "Run only a native write command after explicit confirmation. Never use this tool for SELECT, SHOW, or DESCRIBE; use native_query for all read-only statements",
         annotations(
             title = "Run native write command",
             read_only_hint = false,

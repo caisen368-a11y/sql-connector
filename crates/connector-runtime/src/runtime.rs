@@ -657,8 +657,9 @@ impl Runtime {
         let confirmed = match decision {
             PolicyDecision::Allow => false,
             PolicyDecision::Deny => {
-                let error =
-                    connector_policy::PolicyError::Denied("operation is not permitted".into());
+                let error = connector_policy::PolicyError::Denied(
+                    policy_denial_reason(&profile.policy, action, &authorization.tool).into(),
+                );
                 self.record_audit(
                     &audit_request_id,
                     &authorization.subject,
@@ -1194,6 +1195,35 @@ fn evaluate_mcp_policy(
         return Ok(PolicyDecision::Allow);
     }
     PolicyEngine::evaluate(policy, operation)
+}
+
+fn policy_denial_reason(
+    policy: &connector_core::ConnectionPolicy,
+    action: Action,
+    tool: &str,
+) -> &'static str {
+    if !policy.enabled {
+        return "the connection is disabled by its policy";
+    }
+    if action == Action::NativeRead {
+        if tool == "timeseries_query" {
+            return if policy.allow_time_series_query {
+                "the time-series query is denied by the connection resource or egress policy"
+            } else {
+                "time-series queries are disabled by the connection policy"
+            };
+        }
+        if policy.egress == DataEgress::CloudAllowedMasked {
+            return "native read queries are unavailable with `cloud_allowed_masked`; choose a compatible egress mode and enable `allow_native_read`";
+        }
+        if !policy.allow_native_read {
+            return "native read queries are disabled; enable `allow_native_read` in this connection's policy";
+        }
+    }
+    if action == Action::NativeWrite && !policy.allow_native_write {
+        return "native write commands are disabled by the connection policy";
+    }
+    "operation is not permitted by the connection policy"
 }
 
 async fn cancel_with_timeout(

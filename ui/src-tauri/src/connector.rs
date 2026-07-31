@@ -1,8 +1,14 @@
 use std::{path::PathBuf, process::Stdio, time::Duration};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use serde_json::{Map, Value, json};
 use tokio::{io::AsyncWriteExt, process::Command};
 use zeroize::Zeroizing;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone)]
 pub struct ConnectorClient {
@@ -14,6 +20,8 @@ pub struct ConnectorClient {
 impl ConnectorClient {
     pub fn command(&self) -> Command {
         let mut command = Command::new(&self.binary);
+        #[cfg(windows)]
+        command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
         command
             .kill_on_drop(true)
             .arg("--data-dir")

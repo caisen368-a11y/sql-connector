@@ -130,7 +130,8 @@ TLS、产品选项和限制。当前 manifest 有 24 个 mode，且全部仍为 
 control 命令，不进入 MCP 工具参数。
 
 每个连接有独立策略。UI 默认值为：启用、`local_only`、最多 1000 行、10 MiB、
-30 秒、最多影响 100 行、禁用原生读写、允许时序查询，以及 `*` 资源只读。资源规则
+30 秒、最多影响 100 行、启用只读原生查询、禁用原生写入、允许时序查询，以及 `*`
+资源只读。资源规则
 可分别允许 read/insert/update/delete，并为 `cloud_allowed_masked` 指定
 `maskedFields`。策略仍由 connector runtime 强制执行，桌面审批不能绕过拒绝规则。
 
@@ -146,6 +147,9 @@ control 命令，不进入 MCP 工具参数。
 配置的 OpenAI 服务；它保护的是数据库执行结果和详细数据库错误。包含敏感数据的用户
 提示也会正常外发。
 
+绑定 `local_only` 或未启用原生只读查询的连接时，Chat 会显示授权条。只有用户确认后，
+UI 才会启用只读原生查询并把外发模式改为 `cloud_allowed`；该操作不会开启原生写入。
+
 一个会话最多绑定一个数据库。首条用户消息保存后不能更换绑定，只能新建会话；未绑定
 数据库时是普通对话，不启动数据库工具。
 
@@ -159,13 +163,14 @@ control 命令，不进入 MCP 工具参数。
 3. SSE `response.output_text.delta` 通过 `chat://delta` 推送到 React；取消操作会终止
    HTTP/MCP run。
 4. 收到 `response.completed` 后，最终 assistant 文本明文写回 `ui.sqlite`。单个 run
-   最多执行 8 轮模型/工具往返，超过后停止。
+   最多执行 24 轮模型/工具往返，超过后停止。
 
 ### MCP 数据库查询
 
 1. Rust 读取会话绑定的 profile；停用连接不会向模型提供工具。
 2. 根据该 connector manifest 的 `mcpTools` 过滤 `tools/list`，排除 host-only 工具，
-   并从发给模型的 schema 删除 `connection_id` 和 `request_id`。
+   并从发给模型的 schema 删除 `connection_id`、`request_id`，以及 `native_query` 中仅供
+   写操作使用的 `max_affected` 和 `idempotency_key`。
 3. 每个会话按需启动本地 stdio 进程：
 
    ```text

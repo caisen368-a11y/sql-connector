@@ -337,6 +337,17 @@ export default function App() {
     } : state);
   };
 
+  const enableDatabaseAccess = async (connectionId: string) => {
+    const connection = bootstrap?.connections.find((item) => item.id === connectionId);
+    if (!connection) throw new Error("数据库连接不存在");
+    const updated = await desktopApi.updateConnectionPolicy(connectionId, {
+      ...connection.policy,
+      egress: "cloud_allowed",
+      allowNativeRead: true,
+    });
+    replaceConnection(updated);
+  };
+
   const saveSettings = async (input: OpenAiSettingsInput): Promise<AppSettings> => {
     const saved = await desktopApi.saveOpenAiSettings(input);
     const settings = { ...saved, theme: saved.theme || input.theme };
@@ -386,6 +397,7 @@ export default function App() {
             mcp={bootstrap.mcp}
             onCancel={cancelRun}
             onConnectionChange={updateConversationConnection}
+            onEnableDatabaseAccess={enableDatabaseAccess}
             onResolveApproval={resolveApproval}
             onSend={sendMessage}
             runError={run?.error}

@@ -97,7 +97,9 @@ pub struct NativeRequest {
     /// Positional parameters in protocol order. Drivers must preserve native placeholder syntax.
     #[serde(default)]
     pub positional_parameters: Vec<DbValue>,
+    /// Write-only affected-row bound. Omit this field for native read queries.
     pub max_affected: Option<u64>,
+    /// Write-only retry identity. Omit this field for native read queries.
     pub idempotency_key: Option<String>,
 }
 

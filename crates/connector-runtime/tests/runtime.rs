@@ -358,6 +358,42 @@ async fn dedicated_timeseries_query_does_not_require_generic_native_access() {
 }
 
 #[tokio::test]
+async fn disabled_native_read_reports_how_to_enable_read_only_queries() {
+    let (runtime, connection_id, _) = build_runtime();
+    let operation = DataOperation::NativeQuery(NativeRequest {
+        language: "sql".into(),
+        statement: "SELECT table_schema, table_name, column_name FROM information_schema.columns"
+            .into(),
+        parameters: BTreeMap::new(),
+        positional_parameters: vec![],
+        max_affected: Some(500),
+        idempotency_key: None,
+    });
+    let arguments = serde_json::to_value(&operation).unwrap();
+
+    let error = runtime
+        .execute(
+            connection_id,
+            operation,
+            ExecutionAuthorization {
+                subject: "user".into(),
+                session_id: "session".into(),
+                tool: "native_query".into(),
+                arguments,
+                grant: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeError::Policy(connector_policy::PolicyError::Denied(message))
+            if message.contains("allow_native_read")
+    ));
+}
+
+#[tokio::test]
 async fn catalog_paging_skips_denied_pages_and_returns_visible_entities() {
     let (runtime, connection_id, _) = build_runtime_with(
         true,

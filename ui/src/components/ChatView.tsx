@@ -9,6 +9,7 @@ import {
   Database,
   LoaderCircle,
   SendHorizontal,
+  ShieldCheck,
   TerminalSquare,
   X,
 } from "lucide-react";
@@ -31,6 +32,7 @@ interface ChatViewProps {
   runError?: string | null;
   approvals: ToolApproval[];
   onConnectionChange: (connectionId: string | null) => Promise<void>;
+  onEnableDatabaseAccess: (connectionId: string) => Promise<void>;
   onSend: (content: string) => Promise<void>;
   onCancel: () => Promise<void>;
   onResolveApproval: (approvalId: string, approved: boolean) => Promise<void>;
@@ -208,6 +210,7 @@ export function ChatView({
   runError,
   approvals,
   onConnectionChange,
+  onEnableDatabaseAccess,
   onSend,
   onCancel,
   onResolveApproval,
@@ -215,10 +218,14 @@ export function ChatView({
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [connectionBusy, setConnectionBusy] = useState(false);
+  const [accessBusy, setAccessBusy] = useState(false);
+  const [accessError, setAccessError] = useState<string | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const selectedConnection = connections.find((item) => item.id === conversation?.connectionId);
+  const databaseAccessReady = selectedConnection?.policy.allowNativeRead === true
+    && selectedConnection.policy.egress === "cloud_allowed";
   const connectionLocked = Boolean(conversation?.messages.some((message) => message.role === "user"));
   const running = runStatus === "streaming" || runStatus === "waiting_tool";
 
@@ -250,6 +257,10 @@ export function ChatView({
     textarea.style.height = `${Math.min(textarea.scrollHeight, 180)}px`;
   }, [draft]);
 
+  useEffect(() => {
+    setAccessError(null);
+  }, [selectedConnection?.id]);
+
   const submit = async () => {
     const content = draft.trim();
     if (!content || sending || running) return;
@@ -278,6 +289,23 @@ export function ChatView({
       await onConnectionChange(value || null);
     } finally {
       setConnectionBusy(false);
+    }
+  };
+
+  const enableDatabaseAccess = async () => {
+    if (!selectedConnection || accessBusy) return;
+    const confirmed = window.confirm(
+      "启用后，将允许执行经过只读校验的原生数据库查询，并将完整查询结果发送到已配置的模型服务。本次授权不会开启原生写入。是否继续？",
+    );
+    if (!confirmed) return;
+    setAccessBusy(true);
+    setAccessError(null);
+    try {
+      await onEnableDatabaseAccess(selectedConnection.id);
+    } catch (reason) {
+      setAccessError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setAccessBusy(false);
     }
   };
 
@@ -348,6 +376,25 @@ export function ChatView({
       </div>
 
       <div className="composer-area">
+        {selectedConnection && !databaseAccessReady && (
+          <div className="database-access-notice" role="status">
+            <span className="database-access-icon"><ShieldCheck size={17} /></span>
+            <div className="database-access-copy">
+              <strong>需要数据库查询授权</strong>
+              <span>只读查询的完整结果将发送到已配置的模型，本次授权不会开启原生写入。</span>
+            </div>
+            <button
+              className="button button-secondary button-small"
+              disabled={accessBusy || running}
+              onClick={() => void enableDatabaseAccess()}
+              type="button"
+            >
+              {accessBusy ? <LoaderCircle className="animate-spin" size={14} /> : <ShieldCheck size={14} />}
+              授权只读查询
+            </button>
+          </div>
+        )}
+        {accessError && <div className="database-access-error">{accessError}</div>}
         <div className="composer">
           <textarea
             aria-label="发送消息"

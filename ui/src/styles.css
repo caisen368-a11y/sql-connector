@@ -812,6 +812,55 @@ button:disabled {
   padding: 0 28px 15px;
 }
 
+.database-access-notice {
+  display: flex;
+  width: min(100%, 820px);
+  min-height: 46px;
+  align-items: center;
+  gap: 10px;
+  margin: 0 auto 8px;
+  border: 1px solid color-mix(in srgb, var(--warning) 30%, var(--border));
+  border-radius: 6px;
+  background: var(--warning-soft);
+  padding: 7px 9px;
+}
+
+.database-access-icon {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  color: var(--warning);
+}
+
+.database-access-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 11px;
+}
+
+.database-access-copy strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.database-access-copy span {
+  color: var(--text-secondary);
+}
+
+.database-access-error {
+  width: min(100%, 820px);
+  margin: 0 auto 8px;
+  color: var(--danger);
+  font-size: 11px;
+}
+
 .composer {
   position: relative;
   display: flex;
@@ -1635,6 +1684,15 @@ textarea::placeholder {
   .composer-area {
     padding-left: 14px;
     padding-right: 14px;
+  }
+
+  .database-access-notice {
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
+  .database-access-notice .button {
+    width: 100%;
   }
 
   .form-grid,

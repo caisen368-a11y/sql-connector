@@ -223,7 +223,7 @@ export const DEFAULT_POLICY: ConnectionPolicy = {
   maxBytes: 10 * 1024 * 1024,
   timeoutMs: 30_000,
   maxAffected: 100,
-  allowNativeRead: false,
+  allowNativeRead: true,
   allowNativeWrite: false,
   allowTimeSeriesQuery: true,
   resources: [

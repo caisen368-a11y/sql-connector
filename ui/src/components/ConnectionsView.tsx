@@ -134,7 +134,7 @@ function PolicyEditor({
           <label className="field-label">最多影响行数<input min="1" onChange={(e) => update("maxAffected", e.currentTarget.valueAsNumber)} type="number" value={policy.maxAffected} /></label>
         </div>
         <div className="toggle-list">
-          <label className="toggle-row"><input checked={policy.allowNativeRead} onChange={(e) => update("allowNativeRead", e.target.checked)} type="checkbox" /><span>允许原生查询</span></label>
+          <label className="toggle-row"><input checked={policy.allowNativeRead} onChange={(e) => update("allowNativeRead", e.target.checked)} type="checkbox" /><span>允许只读原生查询（SELECT / SHOW / DESCRIBE）</span></label>
           <label className="toggle-row"><input checked={policy.allowNativeWrite} onChange={(e) => update("allowNativeWrite", e.target.checked)} type="checkbox" /><span>允许原生写入</span></label>
           <label className="toggle-row"><input checked={policy.allowTimeSeriesQuery} onChange={(e) => update("allowTimeSeriesQuery", e.target.checked)} type="checkbox" /><span>允许时序查询</span></label>
         </div>

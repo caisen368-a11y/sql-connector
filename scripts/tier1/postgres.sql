@@ -25,3 +25,8 @@ CREATE INDEX items_qty_idx ON public.items (qty);
 INSERT INTO public.owners (id)
 VALUES (1)
 ON CONFLICT (id) DO NOTHING;
+
+CREATE ROLE tier1_client_identity_secret LOGIN;
+GRANT CONNECT ON DATABASE connector_e2e TO tier1_client_identity_secret;
+GRANT USAGE ON SCHEMA public TO tier1_client_identity_secret;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO tier1_client_identity_secret;

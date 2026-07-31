@@ -1,17 +1,28 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "tier1": [
     {
       "manifest_id": "mysql-protocol",
       "server_versions": ["8.0", "8.4"],
       "platforms": ["macos-15-intel", "macos-15", "windows-2022"],
+      "auth_kinds": ["username_password", "connection_string", "client_certificate"],
       "requirements": [
+        "all_advertised_authentication",
+        "custom_ca",
+        "encrypted_credential_boundary",
+        "error_classification",
+        "native_operations",
+        "secret_non_disclosure",
         "test_connection",
         "db_inspect_schema",
         "bounded_reads",
         "tls_server_verification",
+        "tls_client_certificate",
+        "value_conversion",
         "cancellation",
-        "worker_restart"
+        "worker_restart",
+        "write_unknown_outcome",
+        "writes_all_advertised"
       ],
       "workflow": ".github/workflows/tier1-connectors.yml"
     },
@@ -19,13 +30,24 @@
       "manifest_id": "postgresql-pgwire",
       "server_versions": ["14", "18"],
       "platforms": ["macos-15-intel", "macos-15", "windows-2022"],
+      "auth_kinds": ["username_password", "connection_string", "client_certificate"],
       "requirements": [
+        "all_advertised_authentication",
+        "custom_ca",
+        "encrypted_credential_boundary",
+        "error_classification",
+        "native_operations",
+        "secret_non_disclosure",
         "test_connection",
         "db_inspect_schema",
         "bounded_reads",
         "tls_server_verification",
+        "tls_client_certificate",
+        "value_conversion",
         "cancellation",
-        "worker_restart"
+        "worker_restart",
+        "write_unknown_outcome",
+        "writes_all_advertised"
       ],
       "workflow": ".github/workflows/tier1-connectors.yml"
     }

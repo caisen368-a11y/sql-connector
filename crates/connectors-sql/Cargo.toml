@@ -18,6 +18,7 @@ futures-util = "0.3.31"
 moka = { version = "=0.12.15", features = ["sync"] }
 mysql_async = { version = "=0.36.1", default-features = false, features = ["default-rustls-ring"] }
 oracle-rs = "=0.1.7"
+pkcs8 = { version = "=0.10.2", features = ["pem"] }
 postgres-types = { version = "=0.2.11", features = ["derive", "with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
 rustls = { version = "0.23.35", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2.0"

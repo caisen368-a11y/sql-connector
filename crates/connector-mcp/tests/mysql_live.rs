@@ -183,6 +183,54 @@ async fn mysql_binary_parameters_and_bounded_writes_work_over_mcp() {
             .starts_with(&expected_version_prefix)
     );
 
+    let converted = success(
+        client
+            .call_tool(tool_params(
+                "native_query",
+                &json!({
+                    "connection_id": connection_id,
+                    "request_id": "mysql-value-conversion-1",
+                    "request": {
+                        "language": "mysql",
+                        "statement": "SELECT CAST(18446744073709551615 AS UNSIGNED) AS uint_value, CAST(1234567890.123456789 AS DECIMAL(30,9)) AS decimal_value, CAST('2026-07-31' AS DATE) AS date_value, CAST('12:34:56.123456' AS TIME(6)) AS time_value, CAST('2026-07-31 12:34:56.123456' AS DATETIME(6)) AS datetime_value, UNHEX('0001FF') AS binary_value, CAST('{\"nested\":[1,true,null]}' AS JSON) AS document_value, NULL AS null_value",
+                        "parameters": {},
+                        "positional_parameters": [],
+                        "max_affected": null,
+                        "idempotency_key": null
+                    }
+                }),
+            ))
+            .await
+            .unwrap(),
+    );
+    let converted = &converted["records"][0];
+    assert_eq!(
+        converted["uint_value"],
+        json!({"type": "uint64", "value": 18_446_744_073_709_551_615_u64})
+    );
+    assert_eq!(
+        converted["decimal_value"],
+        json!({"type": "decimal", "value": "1234567890.123456789"})
+    );
+    assert_eq!(
+        converted["date_value"],
+        json!({"type": "date", "value": "2026-07-31"})
+    );
+    assert_eq!(
+        converted["time_value"],
+        json!({"type": "time", "value": "12:34:56.123456"})
+    );
+    assert_eq!(
+        converted["datetime_value"],
+        json!({"type": "date_time", "value": "2026-07-31T12:34:56.123456"})
+    );
+    assert_eq!(
+        converted["binary_value"],
+        json!({"type": "binary", "value": "AAH/"})
+    );
+    assert_eq!(converted["document_value"]["type"], "document");
+    assert_eq!(converted["null_value"], json!({"type": "null"}));
+
     let schema = success(
         client
             .call_tool(tool_params(
@@ -413,6 +461,41 @@ async fn mysql_binary_parameters_and_bounded_writes_work_over_mcp() {
     assert_eq!(read["records"][0]["qty"]["value"], 2);
     assert_eq!(read["records"][1]["qty"]["value"], 3);
     assert_eq!(read["records"][2]["qty"]["value"], 5);
+
+    let successful_native_arguments = json!({
+        "connection_id": connection_id,
+        "request_id": "mysql-native-success-1",
+        "request": {
+            "language": "mysql",
+            "statement": "UPDATE `items` SET `qty` = ? WHERE `id` = ?",
+            "parameters": {},
+            "positional_parameters": [
+                {"type": "int64", "value": 7},
+                {"type": "int64", "value": 1}
+            ],
+            "max_affected": 1,
+            "idempotency_key": null
+        }
+    });
+    let native_updated = success(
+        client
+            .call_tool(granted_tool_params(
+                &confirmation,
+                "native_execute",
+                &successful_native_arguments,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(native_updated["metrics"]["affected"], 1);
+
+    let read = success(
+        client
+            .call_tool(tool_params("sql_read", &read_arguments))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(read["records"][0]["qty"]["value"], 7);
 
     let update_arguments = json!({
         "connection_id": connection_id,

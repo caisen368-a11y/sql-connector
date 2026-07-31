@@ -1,23 +1,45 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
     process::Command,
 };
 
-use connector_core::{ConnectorDescriptor, ConnectorManifest, ConnectorStatus};
+use connector_core::{AuthKind, ConnectorDescriptor, ConnectorManifest, ConnectorStatus};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 const CERTIFICATION_LEDGER: &str = include_str!("../../../docs/connector-certification.json");
 const REQUIRED_PLATFORMS: [&str; 3] = ["macos-15", "macos-15-intel", "windows-2022"];
-const REQUIRED_TIER1_CHECKS: [&str; 6] = [
+const REQUIRED_TIER1_CHECKS: [&str; 16] = [
+    "all_advertised_authentication",
     "bounded_reads",
     "cancellation",
+    "custom_ca",
     "db_inspect_schema",
+    "encrypted_credential_boundary",
+    "error_classification",
+    "native_operations",
+    "secret_non_disclosure",
     "test_connection",
+    "tls_client_certificate",
     "tls_server_verification",
+    "value_conversion",
     "worker_restart",
+    "write_unknown_outcome",
+    "writes_all_advertised",
+];
+const REQUIRED_SECRET_SURFACES: [&str; 7] = [
+    "audit_rows",
+    "control_output",
+    "encrypted_credential_database",
+    "errors",
+    "host_worker_logs",
+    "mcp_output",
+    "profile_database",
 ];
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CertificationLedger {
     schema_version: u32,
     tier1: Vec<Tier1Record>,
@@ -25,20 +47,27 @@ struct CertificationLedger {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Tier1Record {
     manifest_id: String,
     server_versions: Vec<String>,
     platforms: Vec<String>,
+    auth_kinds: Vec<AuthKind>,
     requirements: Vec<String>,
     workflow: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VerifiedRecord {
     manifest_id: String,
     descriptor: ConnectorDescriptor,
     server_versions: Vec<String>,
     platforms: Vec<String>,
+    tested_auth_kinds: Vec<AuthKind>,
+    passed_requirements: Vec<String>,
+    secret_surfaces: Vec<String>,
+    source_fingerprint: String,
     tested_commit: String,
     workflow_run_url: String,
 }
@@ -59,7 +88,10 @@ fn verified_status_without_evidence_is_rejected() {
         .find(|manifest| manifest.id == "mysql-protocol")
         .unwrap()
         .status = ConnectorStatus::Verified;
-    let ledger: CertificationLedger = serde_json::from_str(CERTIFICATION_LEDGER).unwrap();
+    let mut ledger: CertificationLedger = serde_json::from_str(CERTIFICATION_LEDGER).unwrap();
+    ledger
+        .verified
+        .retain(|record| record.manifest_id != "mysql-protocol");
 
     let error = validate_certification(&manifests, &ledger).unwrap_err();
 
@@ -84,7 +116,7 @@ fn validate_certification(
     manifests: &[ConnectorManifest],
     ledger: &CertificationLedger,
 ) -> Result<(), String> {
-    if ledger.schema_version != 1 {
+    if ledger.schema_version != 2 {
         return Err("unsupported connector certification schema version".into());
     }
     let manifests = unique_manifests(manifests)?;
@@ -155,6 +187,11 @@ fn validate_tier1<'a>(
             &REQUIRED_TIER1_CHECKS,
             &format!("Tier 1 connector {} requirements", record.manifest_id),
         )?;
+        require_auth_kinds(
+            &record.auth_kinds,
+            &manifest.auth_kinds,
+            &format!("Tier 1 connector {} authentication", record.manifest_id),
+        )?;
         if record.server_versions.len() < 2 || record.server_versions.iter().any(String::is_empty) {
             return Err(format!(
                 "Tier 1 connector {} must declare at least two server versions",
@@ -216,6 +253,22 @@ fn validate_verified_record(
         &REQUIRED_PLATFORMS,
         &format!("verified connector {} platforms", manifest.id),
     )?;
+    require_auth_kinds(
+        &evidence.tested_auth_kinds,
+        &manifest.auth_kinds,
+        &format!("verified connector {} authentication", manifest.id),
+    )?;
+    require_values(
+        &evidence.secret_surfaces,
+        &REQUIRED_SECRET_SURFACES,
+        &format!("verified connector {} secret surfaces", manifest.id),
+    )?;
+    if evidence.source_fingerprint != tier1_source_fingerprint() {
+        return Err(format!(
+            "certification evidence for {} has a stale source fingerprint",
+            manifest.id
+        ));
+    }
     if evidence.server_versions.is_empty() || evidence.server_versions.iter().any(String::is_empty)
     {
         return Err(format!(
@@ -224,12 +277,22 @@ fn validate_verified_record(
         ));
     }
     if let Some(tier1) = tier1 {
-        for required in &tier1.server_versions {
-            if !evidence
-                .server_versions
+        require_values(
+            &evidence.passed_requirements,
+            &tier1
+                .requirements
                 .iter()
-                .any(|tested| tested.starts_with(required))
-            {
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            &format!("verified connector {} passed requirements", manifest.id),
+        )?;
+        for required in &tier1.server_versions {
+            if !evidence.server_versions.iter().any(|tested| {
+                tested == required
+                    || tested
+                        .strip_prefix(required)
+                        .is_some_and(|suffix| suffix.starts_with('.'))
+            }) {
                 return Err(format!(
                     "verified connector {} is missing Tier 1 server version {}",
                     manifest.id, required
@@ -241,15 +304,18 @@ fn validate_verified_record(
         || !evidence
             .tested_commit
             .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     {
         return Err(format!(
             "verified connector {} has an invalid tested commit",
             manifest.id
         ));
     }
-    if !evidence.workflow_run_url.starts_with("https://github.com/")
-        || !evidence.workflow_run_url.contains("/actions/runs/")
+    let run_id = evidence
+        .workflow_run_url
+        .strip_prefix("https://github.com/caisen368-a11y/sql-connector/actions/runs/");
+    if run_id
+        .is_none_or(|run_id| run_id.is_empty() || !run_id.bytes().all(|byte| byte.is_ascii_digit()))
     {
         return Err(format!(
             "verified connector {} has an invalid workflow run URL",
@@ -257,6 +323,287 @@ fn validate_verified_record(
         ));
     }
     Ok(())
+}
+
+fn require_auth_kinds(
+    actual: &[AuthKind],
+    expected: &[AuthKind],
+    label: &str,
+) -> Result<(), String> {
+    let actual = actual.iter().copied().collect::<BTreeSet<_>>();
+    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(format!("{label} do not match the connector manifest"));
+    }
+    Ok(())
+}
+
+fn tier1_source_fingerprint() -> String {
+    let sources: &[(&str, &[u8])] = &[
+        ("Cargo.toml", include_bytes!("../../../Cargo.toml")),
+        ("Cargo.lock", include_bytes!("../../../Cargo.lock")),
+        (
+            ".github/workflows/tier1-connectors.yml",
+            include_bytes!("../../../.github/workflows/tier1-connectors.yml"),
+        ),
+        (
+            "apps/sql-connector/Cargo.toml",
+            include_bytes!("../Cargo.toml"),
+        ),
+        (
+            "apps/sql-connector/src/main.rs",
+            include_bytes!("../src/main.rs"),
+        ),
+        (
+            "apps/sql-connector/src/worker.rs",
+            include_bytes!("../src/worker.rs"),
+        ),
+        (
+            "apps/sql-connector/tests/tier1_auth_live.rs",
+            include_bytes!("tier1_auth_live.rs"),
+        ),
+        (
+            "apps/sql-connector/tests/certification.rs",
+            include_bytes!("certification.rs"),
+        ),
+        (
+            "crates/connector-control/Cargo.toml",
+            include_bytes!("../../../crates/connector-control/Cargo.toml"),
+        ),
+        (
+            "crates/connector-control/src/lib.rs",
+            include_bytes!("../../../crates/connector-control/src/lib.rs"),
+        ),
+        (
+            "crates/connector-control/tests/control.rs",
+            include_bytes!("../../../crates/connector-control/tests/control.rs"),
+        ),
+        (
+            "crates/connector-core/Cargo.toml",
+            include_bytes!("../../../crates/connector-core/Cargo.toml"),
+        ),
+        (
+            "crates/connector-core/src/capability.rs",
+            include_bytes!("../../../crates/connector-core/src/capability.rs"),
+        ),
+        (
+            "crates/connector-core/src/config.rs",
+            include_bytes!("../../../crates/connector-core/src/config.rs"),
+        ),
+        (
+            "crates/connector-core/src/connector.rs",
+            include_bytes!("../../../crates/connector-core/src/connector.rs"),
+        ),
+        (
+            "crates/connector-core/src/error.rs",
+            include_bytes!("../../../crates/connector-core/src/error.rs"),
+        ),
+        (
+            "crates/connector-core/src/operation.rs",
+            include_bytes!("../../../crates/connector-core/src/operation.rs"),
+        ),
+        (
+            "crates/connector-core/src/value.rs",
+            include_bytes!("../../../crates/connector-core/src/value.rs"),
+        ),
+        (
+            "crates/connector-core/src/lib.rs",
+            include_bytes!("../../../crates/connector-core/src/lib.rs"),
+        ),
+        (
+            "crates/connector-core/tests/contracts.rs",
+            include_bytes!("../../../crates/connector-core/tests/contracts.rs"),
+        ),
+        (
+            "crates/connector-ipc/Cargo.toml",
+            include_bytes!("../../../crates/connector-ipc/Cargo.toml"),
+        ),
+        (
+            "crates/connector-ipc/src/client.rs",
+            include_bytes!("../../../crates/connector-ipc/src/client.rs"),
+        ),
+        (
+            "crates/connector-ipc/src/connector.rs",
+            include_bytes!("../../../crates/connector-ipc/src/connector.rs"),
+        ),
+        (
+            "crates/connector-ipc/src/frame.rs",
+            include_bytes!("../../../crates/connector-ipc/src/frame.rs"),
+        ),
+        (
+            "crates/connector-ipc/src/message.rs",
+            include_bytes!("../../../crates/connector-ipc/src/message.rs"),
+        ),
+        (
+            "crates/connector-ipc/src/supervisor.rs",
+            include_bytes!("../../../crates/connector-ipc/src/supervisor.rs"),
+        ),
+        (
+            "crates/connector-ipc/src/lib.rs",
+            include_bytes!("../../../crates/connector-ipc/src/lib.rs"),
+        ),
+        (
+            "crates/connector-ipc/tests/framing.rs",
+            include_bytes!("../../../crates/connector-ipc/tests/framing.rs"),
+        ),
+        (
+            "crates/connector-mcp/Cargo.toml",
+            include_bytes!("../../../crates/connector-mcp/Cargo.toml"),
+        ),
+        (
+            "crates/connector-mcp/src/input.rs",
+            include_bytes!("../../../crates/connector-mcp/src/input.rs"),
+        ),
+        (
+            "crates/connector-mcp/src/server.rs",
+            include_bytes!("../../../crates/connector-mcp/src/server.rs"),
+        ),
+        (
+            "crates/connector-mcp/src/lib.rs",
+            include_bytes!("../../../crates/connector-mcp/src/lib.rs"),
+        ),
+        (
+            "crates/connector-mcp/tests/mysql_live.rs",
+            include_bytes!("../../../crates/connector-mcp/tests/mysql_live.rs"),
+        ),
+        (
+            "crates/connector-mcp/tests/postgres_live.rs",
+            include_bytes!("../../../crates/connector-mcp/tests/postgres_live.rs"),
+        ),
+        (
+            "crates/connector-mcp/tests/support/mod.rs",
+            include_bytes!("../../../crates/connector-mcp/tests/support/mod.rs"),
+        ),
+        (
+            "crates/connector-policy/Cargo.toml",
+            include_bytes!("../../../crates/connector-policy/Cargo.toml"),
+        ),
+        (
+            "crates/connector-policy/src/grant.rs",
+            include_bytes!("../../../crates/connector-policy/src/grant.rs"),
+        ),
+        (
+            "crates/connector-policy/src/lib.rs",
+            include_bytes!("../../../crates/connector-policy/src/lib.rs"),
+        ),
+        (
+            "crates/connector-policy/src/policy.rs",
+            include_bytes!("../../../crates/connector-policy/src/policy.rs"),
+        ),
+        (
+            "crates/connector-policy/tests/authorization.rs",
+            include_bytes!("../../../crates/connector-policy/tests/authorization.rs"),
+        ),
+        (
+            "crates/connector-runtime/Cargo.toml",
+            include_bytes!("../../../crates/connector-runtime/Cargo.toml"),
+        ),
+        (
+            "crates/connector-runtime/src/lib.rs",
+            include_bytes!("../../../crates/connector-runtime/src/lib.rs"),
+        ),
+        (
+            "crates/connector-runtime/src/registry.rs",
+            include_bytes!("../../../crates/connector-runtime/src/registry.rs"),
+        ),
+        (
+            "crates/connector-runtime/src/runtime.rs",
+            include_bytes!("../../../crates/connector-runtime/src/runtime.rs"),
+        ),
+        (
+            "crates/connector-runtime/tests/runtime.rs",
+            include_bytes!("../../../crates/connector-runtime/tests/runtime.rs"),
+        ),
+        (
+            "crates/connector-store/Cargo.toml",
+            include_bytes!("../../../crates/connector-store/Cargo.toml"),
+        ),
+        (
+            "crates/connector-store/src/audit.rs",
+            include_bytes!("../../../crates/connector-store/src/audit.rs"),
+        ),
+        (
+            "crates/connector-store/src/credential.rs",
+            include_bytes!("../../../crates/connector-store/src/credential.rs"),
+        ),
+        (
+            "crates/connector-store/src/lib.rs",
+            include_bytes!("../../../crates/connector-store/src/lib.rs"),
+        ),
+        (
+            "crates/connector-store/src/profile.rs",
+            include_bytes!("../../../crates/connector-store/src/profile.rs"),
+        ),
+        (
+            "crates/connector-store/tests/os_credential.rs",
+            include_bytes!("../../../crates/connector-store/tests/os_credential.rs"),
+        ),
+        (
+            "crates/connector-store/tests/persistence.rs",
+            include_bytes!("../../../crates/connector-store/tests/persistence.rs"),
+        ),
+        (
+            "crates/connector-store/tests/sqlite_credential.rs",
+            include_bytes!("../../../crates/connector-store/tests/sqlite_credential.rs"),
+        ),
+        (
+            "crates/connectors-sql/Cargo.toml",
+            include_bytes!("../../../crates/connectors-sql/Cargo.toml"),
+        ),
+        (
+            "crates/connectors-sql/src/cancellation.rs",
+            include_bytes!("../../../crates/connectors-sql/src/cancellation.rs"),
+        ),
+        (
+            "crates/connectors-sql/src/common.rs",
+            include_bytes!("../../../crates/connectors-sql/src/common.rs"),
+        ),
+        (
+            "crates/connectors-sql/src/lib.rs",
+            include_bytes!("../../../crates/connectors-sql/src/lib.rs"),
+        ),
+        (
+            "crates/connectors-sql/src/mysql.rs",
+            include_bytes!("../../../crates/connectors-sql/src/mysql.rs"),
+        ),
+        (
+            "crates/connectors-sql/src/postgres.rs",
+            include_bytes!("../../../crates/connectors-sql/src/postgres.rs"),
+        ),
+        (
+            "crates/connectors-sql/src/relational_metadata.rs",
+            include_bytes!("../../../crates/connectors-sql/src/relational_metadata.rs"),
+        ),
+        (
+            "scripts/tier1/mysql.sql",
+            include_bytes!("../../../scripts/tier1/mysql.sql"),
+        ),
+        (
+            "scripts/tier1/postgres.sql",
+            include_bytes!("../../../scripts/tier1/postgres.sql"),
+        ),
+    ];
+    let mut hasher = Sha256::new();
+    for (path, source) in sources {
+        hasher.update(path.len().to_le_bytes());
+        hasher.update(path.as_bytes());
+        let source = String::from_utf8_lossy(source)
+            .replace(
+                "status: ConnectorStatus::Experimental",
+                "status: ConnectorStatus::CertificationState",
+            )
+            .replace(
+                "status: ConnectorStatus::Verified",
+                "status: ConnectorStatus::CertificationState",
+            );
+        hasher.update(source.len().to_le_bytes());
+        hasher.update(source.as_bytes());
+    }
+    let mut fingerprint = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        write!(&mut fingerprint, "{byte:02x}").unwrap();
+    }
+    fingerprint
 }
 
 fn require_values(actual: &[String], expected: &[&str], label: &str) -> Result<(), String> {

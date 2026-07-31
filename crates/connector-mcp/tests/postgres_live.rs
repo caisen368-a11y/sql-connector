@@ -58,6 +58,7 @@ async fn postgres_connection_is_identified_and_crud_is_policy_controlled_over_mc
             egress: DataEgress::LocalOnly,
             max_affected: 10,
             allow_native_read: true,
+            allow_native_write: true,
             resources: vec![
                 ResourceRule {
                     pattern: target.clone(),
@@ -195,6 +196,46 @@ async fn postgres_connection_is_identified_and_crud_is_policy_controlled_over_mc
             .unwrap()
             .starts_with(&expected_version_prefix)
     );
+
+    let converted = success(
+        client
+            .call_tool(tool_params(
+                "native_query",
+                &json!({
+                    "connection_id": connection_id,
+                    "request_id": "postgres-value-conversion-1",
+                    "request": {
+                        "language": "postgresql",
+                        "statement": "SELECT TRUE AS bool_value, 9223372036854775807::bigint AS int_value, 1234567890.123456789::numeric AS decimal_value, '{\"nested\":[1,true,null]}'::jsonb AS document_value, NULL::text AS null_value",
+                        "parameters": {},
+                        "positional_parameters": [],
+                        "max_affected": null,
+                        "idempotency_key": null
+                    }
+                }),
+            ))
+            .await
+            .unwrap(),
+    );
+    let converted = &converted["records"][0];
+    assert_eq!(
+        converted["bool_value"],
+        json!({"type": "bool", "value": true})
+    );
+    assert_eq!(
+        converted["int_value"],
+        json!({"type": "int64", "value": 9_223_372_036_854_775_807_i64})
+    );
+    assert_eq!(
+        converted["decimal_value"],
+        json!({"type": "decimal", "value": "1234567890.123456789"})
+    );
+    assert_eq!(converted["document_value"]["type"], "document");
+    assert_eq!(
+        converted["document_value"]["value"]["nested"]["value"][1],
+        json!({"type": "bool", "value": true})
+    );
+    assert_eq!(converted["null_value"], json!({"type": "null"}));
 
     let catalog = success(
         client
@@ -413,6 +454,69 @@ async fn postgres_connection_is_identified_and_crud_is_policy_controlled_over_mc
         read["records"][0]["metadata"]["value"]["source"]["value"],
         "mcp"
     );
+
+    let over_limit_native_arguments = json!({
+        "connection_id": connection_id,
+        "request_id": "postgres-native-over-limit-1",
+        "request": {
+            "language": "postgresql",
+            "statement": "UPDATE \"items\" SET \"qty\" = $1",
+            "parameters": {},
+            "positional_parameters": [{"type": "int64", "value": 99}],
+            "max_affected": 1,
+            "idempotency_key": null
+        }
+    });
+    let rolled_back = client
+        .call_tool(granted_tool_params(
+            &confirmation,
+            "native_execute",
+            &over_limit_native_arguments,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rolled_back.is_error, Some(true));
+    assert_eq!(
+        rolled_back.structured_content.unwrap()["error"]["code"],
+        "permission_denied"
+    );
+
+    let native_arguments = json!({
+        "connection_id": connection_id,
+        "request_id": "postgres-native-update-1",
+        "request": {
+            "language": "postgresql",
+            "statement": "UPDATE \"items\" SET \"qty\" = $1 WHERE \"id\" = $2",
+            "parameters": {},
+            "positional_parameters": [
+                {"type": "int64", "value": 7},
+                {"type": "int64", "value": 1}
+            ],
+            "max_affected": 1,
+            "idempotency_key": null
+        }
+    });
+    let native_updated = success(
+        client
+            .call_tool(granted_tool_params(
+                &confirmation,
+                "native_execute",
+                &native_arguments,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(native_updated["metrics"]["affected"], 1);
+
+    let read = success(
+        client
+            .call_tool(tool_params("sql_read", &read_arguments))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(read["records"][0]["qty"]["value"], 7);
+    assert_eq!(read["records"][1]["qty"]["value"], 3);
+    assert_eq!(read["records"][2]["qty"]["value"], 5);
 
     let update_arguments = json!({
         "connection_id": connection_id,

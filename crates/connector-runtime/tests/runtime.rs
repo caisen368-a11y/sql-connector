@@ -160,7 +160,10 @@ impl Connector for FakeConnector {
         _secret: &SecretMaterial,
         operation: DataOperation,
     ) -> connector_core::Result<OperationResult> {
-        if context.request_id == "client-request-1" {
+        if matches!(
+            context.request_id.as_str(),
+            "client-request-1" | "timeout-write-1"
+        ) {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }
         let next_cursor = match &operation {
@@ -230,6 +233,16 @@ fn build_runtime_with_verifier(
     grant_verifier: Option<Arc<GrantVerifier>>,
     egress: DataEgress,
 ) -> (Runtime, ConnectionId, Arc<AuditRepository>) {
+    build_runtime_with_verifier_and_timeout(discover, resources, grant_verifier, egress, 30_000)
+}
+
+fn build_runtime_with_verifier_and_timeout(
+    discover: bool,
+    resources: Vec<ResourceRule>,
+    grant_verifier: Option<Arc<GrantVerifier>>,
+    egress: DataEgress,
+    timeout_ms: u64,
+) -> (Runtime, ConnectionId, Arc<AuditRepository>) {
     let profiles = Arc::new(ProfileRepository::open_in_memory().unwrap());
     let credentials = Arc::new(InMemoryCredentialStore::default());
     let audit = Arc::new(AuditRepository::open_in_memory().unwrap());
@@ -248,6 +261,7 @@ fn build_runtime_with_verifier(
         policy: ConnectionPolicy {
             egress,
             max_rows: 2,
+            timeout_ms,
             resources,
             ..ConnectionPolicy::default()
         },
@@ -948,6 +962,80 @@ async fn successful_write_idempotency_key_is_not_executed_twice() {
             if error.category == connector_core::ErrorCategory::Conflict
                 && error.code.as_deref() == Some("idempotency_key_conflict")
     ));
+}
+
+#[tokio::test]
+async fn timed_out_write_is_unknown_and_its_idempotency_key_is_not_reused() {
+    let issuer = GrantIssuer::new(SigningKey::from_bytes(&[9; 32]));
+    let verifier = Arc::new(GrantVerifier::new(issuer.verifying_key()));
+    let (runtime, connection_id, audit) = build_runtime_with_verifier_and_timeout(
+        false,
+        vec![ResourceRule {
+            pattern: "public.*".into(),
+            allow_read: true,
+            allow_insert: true,
+            allow_update: false,
+            allow_delete: false,
+            masked_fields: Vec::new(),
+        }],
+        Some(verifier),
+        DataEgress::LocalOnly,
+        20,
+    );
+    let operation = DataOperation::Insert(InsertRequest {
+        target: "public.items".into(),
+        records: vec![DbRecord::from([("id".into(), DbValue::Int64(1))])],
+        idempotency_key: Some("unknown-write-1".into()),
+    });
+
+    let error = runtime
+        .execute_with_request_id(
+            connection_id,
+            operation.clone(),
+            write_authorization(&issuer, connection_id, &operation, "timeout-write-grant-1"),
+            Some("timeout-write-1".into()),
+        )
+        .await
+        .unwrap_err();
+    let RuntimeError::Connector(error) = error else {
+        panic!("a timed-out write must return a connector error");
+    };
+    assert_eq!(
+        error.category,
+        connector_core::ErrorCategory::UnknownOutcome
+    );
+    assert!(!error.retryable);
+
+    let repeated = runtime
+        .execute(
+            connection_id,
+            operation.clone(),
+            write_authorization(&issuer, connection_id, &operation, "timeout-write-grant-2"),
+        )
+        .await
+        .unwrap_err();
+    let RuntimeError::Connector(repeated) = repeated else {
+        panic!("an unknown idempotency state must return a connector error");
+    };
+    assert_eq!(
+        repeated.category,
+        connector_core::ErrorCategory::UnknownOutcome
+    );
+    assert_eq!(
+        repeated.code.as_deref(),
+        Some("idempotency_unknown_outcome")
+    );
+
+    let events = audit
+        .query(&AuditQuery {
+            connection_id: Some(connection_id),
+            limit: 10,
+            ..AuditQuery::default()
+        })
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.error_category == Some(connector_core::ErrorCategory::UnknownOutcome)
+    }));
 }
 
 #[test]

@@ -21,6 +21,7 @@ use mysql_async::{
     Pool, PoolConstraints, PoolOpts, Row, SslOpts, TxOpts, Value, consts::ColumnType,
     prelude::Queryable,
 };
+use pkcs8::{LineEnding, ObjectIdentifier, PrivateKeyInfo, SecretDocument};
 
 use crate::{
     cancellation::CancellationRegistry,
@@ -50,6 +51,7 @@ const CONNECTION_CACHE_CAPACITY: u64 = 64;
 const CONNECTION_CACHE_IDLE: Duration = Duration::from_secs(120);
 const CONNECTION_IDLE: Duration = Duration::from_secs(60);
 const CONNECTION_POOL_SIZE: usize = 4;
+const RSA_ENCRYPTION_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
 
 /// `MySQL` wire-protocol connector and explicitly identified compatible products.
 #[derive(Clone)]
@@ -271,11 +273,11 @@ impl Connector for MySqlConnector {
             .run(&context, false, async move {
                 let timeout = effective_timeout(&task_context, &profile, None)?;
                 let mut connection = connect(&pools, &profile, &secret, timeout).await?;
-                let row: Option<(String, Option<String>, String)> = connection
-                    .query_first("SELECT VERSION(), DATABASE(), CURRENT_USER()")
+                let row: Option<(String,)> = connection
+                    .query_first("SELECT VERSION()")
                     .await
                     .map_err(|error| map_mysql_error(&error, false))?;
-                let (version, database, user) = row.ok_or_else(|| {
+                let (version,) = row.ok_or_else(|| {
                     ConnectorError::new(
                         ErrorCategory::Protocol,
                         "MySQL identity query returned no row",
@@ -286,11 +288,7 @@ impl Connector for MySqlConnector {
                     product_name: flavor_name(flavor).into(),
                     product_version: Some(version),
                     api_mode: api_mode(flavor).into(),
-                    server_identity: Some(format!(
-                        "{}/{}",
-                        database.unwrap_or_else(|| "(no database)".into()),
-                        user
-                    )),
+                    server_identity: None,
                     warnings: vec![],
                 })
             })
@@ -771,9 +769,10 @@ fn build_options(profile: &ConnectionProfile, secret: &SecretMaterial) -> Result
                     .ok_or_else(|| {
                         missing_tls_secret("client_private_key_pem or private_key_pem")
                     })?;
+            let private_key_pem = normalize_mysql_client_private_key(private_key_pem)?;
             ssl = ssl.with_client_identity(Some(ClientIdentity::new(
                 certificate_pem.as_bytes().to_vec().into(),
-                private_key_pem.as_bytes().to_vec().into(),
+                private_key_pem.into(),
             )));
         }
         builder.ssl_opts(Some(ssl))
@@ -855,6 +854,40 @@ fn missing_tls_secret(name: &str) -> ConnectorError {
         ErrorCategory::Authentication,
         format!("MySQL TLS credential field {name} is required"),
     )
+}
+
+fn normalize_mysql_client_private_key(private_key_pem: &str) -> Result<Vec<u8>> {
+    // MySQL-generated PEM files can contain a trailing NUL after the footer.
+    let private_key_pem = private_key_pem
+        .trim_end_matches(|character: char| character == '\0' || character.is_ascii_whitespace());
+    let (label, document) = SecretDocument::from_pem(private_key_pem)
+        .map_err(|_| invalid_mysql_client_private_key())?;
+    let pkcs1_document = match label {
+        "RSA PRIVATE KEY" => document,
+        "PRIVATE KEY" => {
+            let private_key = PrivateKeyInfo::try_from(document.as_bytes())
+                .map_err(|_| invalid_mysql_client_private_key())?;
+            if private_key.algorithm.oid != RSA_ENCRYPTION_OID {
+                return Err(invalid_mysql_client_private_key());
+            }
+            SecretDocument::try_from(private_key.private_key)
+                .map_err(|_| invalid_mysql_client_private_key())?
+        }
+        _ => return Err(invalid_mysql_client_private_key()),
+    };
+    let normalized = pkcs1_document
+        .to_pem("RSA PRIVATE KEY", LineEnding::LF)
+        .map_err(|_| invalid_mysql_client_private_key())?;
+    Ok(normalized.as_bytes().to_vec())
+}
+
+fn invalid_mysql_client_private_key() -> ConnectorError {
+    ConnectorError::new(
+        ErrorCategory::InvalidRequest,
+        "MySQL client private key must be an unencrypted RSA key in PKCS#1 or PKCS#8 PEM format",
+    )
+    .with_phase(ErrorPhase::Tls)
+    .with_code("invalid_client_private_key")
 }
 
 async fn connect(
@@ -1292,6 +1325,9 @@ fn map_mysql_error(error: &MySqlError, write: bool) -> ConnectorError {
         .with_code(server.code.to_string())
         .retryable(matches!(server.code, 1040 | 1053 | 1205 | 1213));
     }
+    if matches!(error, MySqlError::Driver(DriverError::NoKeyFound)) {
+        return invalid_mysql_client_private_key();
+    }
     if mysql_error_is_tls(error) {
         return ConnectorError::new(
             if write {
@@ -1338,7 +1374,7 @@ fn error_chain_includes_rustls(error: &(dyn StdError + 'static)) -> bool {
 mod tests {
     use std::{
         collections::BTreeMap,
-        env,
+        env, io,
         time::{Duration, Instant},
     };
 
@@ -1347,12 +1383,27 @@ mod tests {
         DbValue, ErrorCategory, ErrorPhase, Product, SecretMaterial, TlsConfig,
     };
     use mysql_async::{DriverError, Error as MySqlError, IoError};
+    use pkcs8::{LineEnding, SecretDocument};
     use url::Url;
 
     use super::{
         MySqlConnector, MySqlFlavor, assemble_mysql_metadata, build_options, map_mysql_error,
-        verify_server_flavor,
+        normalize_mysql_client_private_key, verify_server_flavor,
     };
+
+    const TEST_PKCS1_DER: &[u8] = &[0x30, 0x03, 0x02, 0x01, 0x00];
+    const TEST_PKCS8_DER: &[u8] = &[
+        0x30, 0x19, 0x02, 0x01, 0x00, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d,
+        0x01, 0x01, 0x01, 0x05, 0x00, 0x04, 0x05, 0x30, 0x03, 0x02, 0x01, 0x00,
+    ];
+
+    fn test_private_key_pem(label: &'static str, der: &[u8]) -> String {
+        SecretDocument::try_from(der)
+            .unwrap()
+            .to_pem(label, LineEnding::LF)
+            .unwrap()
+            .to_string()
+    }
 
     fn profile() -> ConnectionProfile {
         ConnectionProfile {
@@ -1547,6 +1598,39 @@ mod tests {
     }
 
     #[test]
+    fn missing_mysql_client_key_is_a_non_retryable_tls_configuration_error() {
+        let error = MySqlError::Driver(DriverError::NoKeyFound);
+
+        for write in [false, true] {
+            let mapped = map_mysql_error(&error, write);
+            assert_eq!(mapped.category, ErrorCategory::InvalidRequest);
+            assert_eq!(mapped.phase, ErrorPhase::Tls);
+            assert_eq!(mapped.code.as_deref(), Some("invalid_client_private_key"));
+            assert_eq!(
+                mapped.message,
+                "MySQL client private key must be an unencrypted RSA key in PKCS#1 or PKCS#8 PEM format"
+            );
+            assert!(!mapped.retryable);
+        }
+    }
+
+    #[test]
+    fn mysql_client_key_normalization_accepts_pkcs1_and_pkcs8() {
+        let pkcs1 = test_private_key_pem("RSA PRIVATE KEY", TEST_PKCS1_DER);
+        let pkcs8 = format!("{}\0", test_private_key_pem("PRIVATE KEY", TEST_PKCS8_DER));
+
+        for private_key in [pkcs1, pkcs8] {
+            let normalized = normalize_mysql_client_private_key(&private_key).unwrap();
+            let keys = rustls_pemfile::rsa_private_keys(&mut normalized.as_slice())
+                .collect::<io::Result<Vec<_>>>()
+                .unwrap();
+
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys[0].secret_pkcs1_der(), TEST_PKCS1_DER);
+        }
+    }
+
+    #[test]
     fn building_mysql_options_installs_a_crypto_provider() {
         let mut profile = profile();
         profile.auth_kind = AuthKind::UsernamePassword;
@@ -1575,7 +1659,7 @@ mod tests {
         const CLIENT_REFERENCE: &str = "C:\\definitely\\not\\a\\mysql-client.pem";
         const CA_BYTES: &[u8] = b"CA bytes from secret material";
         const CLIENT_BYTES: &[u8] = b"client certificate bytes from secret material";
-        const PRIVATE_KEY_BYTES: &[u8] = b"preferred private key bytes";
+        let private_key_pem = test_private_key_pem("RSA PRIVATE KEY", TEST_PKCS1_DER);
 
         let mut profile = profile();
         profile.tls.ca_certificate_ref = Some(CA_REFERENCE.into());
@@ -1592,10 +1676,7 @@ mod tests {
                     CLIENT_REFERENCE.into(),
                     String::from_utf8_lossy(CLIENT_BYTES).into(),
                 ),
-                (
-                    "client_private_key_pem".into(),
-                    String::from_utf8_lossy(PRIVATE_KEY_BYTES).into(),
-                ),
+                ("client_private_key_pem".into(), private_key_pem.clone()),
                 ("private_key_pem".into(), "legacy private key bytes".into()),
             ]),
         };
@@ -1611,7 +1692,7 @@ mod tests {
 
         assert_eq!(ca.as_ref(), CA_BYTES);
         assert_eq!(certificate.as_ref(), CLIENT_BYTES);
-        assert_eq!(private_key.as_ref(), PRIVATE_KEY_BYTES);
+        assert_eq!(private_key.as_ref(), private_key_pem.as_bytes());
     }
 
     #[test]

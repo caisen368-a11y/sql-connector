@@ -158,7 +158,7 @@ async fn yugabyte_ysql_crud_is_policy_controlled_over_mcp_worker() {
             .unwrap()
             .contains("YB-2026.1.0.1")
     );
-    assert_eq!(connection_info["server_identity"], "mcpdb/mcp_ysql");
+    assert!(connection_info["server_identity"].is_null());
 
     let catalog = success(
         client

@@ -310,18 +310,16 @@ impl Connector for PostgresConnector {
                 let timeout = effective_timeout(&task_context, &profile, None)?;
                 let client = connect(&pools, &profile, &secret, timeout).await?;
                 let row = client
-                    .query_one("SELECT version(), current_database(), current_user", &[])
+                    .query_one("SELECT version()", &[])
                     .await
                     .map_err(|error| map_pg_error(&error, false))?;
                 let version: String = row.get(0);
-                let database: String = row.get(1);
-                let user: String = row.get(2);
                 verify_server_flavor(flavor, &version)?;
                 Ok(ConnectionInfo {
                     product_name: flavor_name(flavor).into(),
                     product_version: Some(version),
                     api_mode: api_mode(flavor).into(),
-                    server_identity: Some(format!("{database}/{user}")),
+                    server_identity: None,
                     warnings: vec![],
                 })
             })

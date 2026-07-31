@@ -114,10 +114,7 @@ async fn tidb_crud_and_native_write_limits_work_over_mcp_worker() {
             .unwrap()
             .contains("TiDB-v8.5.7")
     );
-    assert_eq!(
-        connection_info["server_identity"],
-        "connector_test/connector_user@%"
-    );
+    assert!(connection_info["server_identity"].is_null());
 
     let catalog = success(
         client

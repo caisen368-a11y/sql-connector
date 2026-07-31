@@ -144,10 +144,7 @@ async fn oceanbase_mysql_crud_is_policy_controlled_over_mcp_worker() {
             .unwrap()
             .contains("OceanBase_CE-v4.4.2.2")
     );
-    assert_eq!(
-        connection_info["server_identity"],
-        "connector_test/connector_user@%"
-    );
+    assert!(connection_info["server_identity"].is_null());
 
     let catalog = success(
         client

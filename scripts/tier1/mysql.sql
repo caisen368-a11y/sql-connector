@@ -12,6 +12,16 @@ GRANT ALL PRIVILEGES ON connector_e2e.* TO 'connector'@'localhost';
 GRANT ALL PRIVILEGES ON connector_e2e.* TO 'connector'@'127.0.0.1';
 GRANT ALL PRIVILEGES ON connector_e2e.* TO 'connector'@'%';
 
+CREATE USER IF NOT EXISTS 'tier1_client_identity_secret'@'localhost' REQUIRE X509;
+CREATE USER IF NOT EXISTS 'tier1_client_identity_secret'@'127.0.0.1' REQUIRE X509;
+CREATE USER IF NOT EXISTS 'tier1_client_identity_secret'@'%' REQUIRE X509;
+ALTER USER 'tier1_client_identity_secret'@'localhost' REQUIRE X509;
+ALTER USER 'tier1_client_identity_secret'@'127.0.0.1' REQUIRE X509;
+ALTER USER 'tier1_client_identity_secret'@'%' REQUIRE X509;
+GRANT SELECT ON connector_e2e.* TO 'tier1_client_identity_secret'@'localhost';
+GRANT SELECT ON connector_e2e.* TO 'tier1_client_identity_secret'@'127.0.0.1';
+GRANT SELECT ON connector_e2e.* TO 'tier1_client_identity_secret'@'%';
+
 USE connector_e2e;
 
 CREATE TABLE owners (

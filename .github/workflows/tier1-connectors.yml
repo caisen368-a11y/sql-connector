@@ -40,10 +40,21 @@ jobs:
           cargo +1.96.1 test --locked -p connectors-sql --lib
           common::tests::
 
+      - name: Validate MySQL client private-key formats
+        run: >-
+          cargo +1.96.1 test --locked -p connectors-sql --lib
+          mysql_client
+
       - name: Validate Runtime cursor protection
         run: >-
           cargo +1.96.1 test --locked -p connector-runtime --lib
           byte_guard_rejects_paged_results_without_mutating_the_opaque_cursor
+
+      - name: Validate write unknown-outcome protection
+        run: >-
+          cargo +1.96.1 test --locked -p connector-runtime --test runtime
+          timed_out_write_is_unknown_and_its_idempotency_key_is_not_reused
+          -- --exact
 
   matrix:
     name: Build Tier 1 matrix
@@ -92,6 +103,7 @@ jobs:
       TIER1_DATABASE: connector_e2e
       TIER1_USERNAME: connector
       TIER1_PASSWORD: connector-ci-password
+      TIER1_CLIENT_USERNAME: tier1_client_identity_secret
       TIER1_MYSQL_ROOT_PASSWORD: root-ci-password
       TIER1_POSTGRES_PORT: "55432"
       TIER1_MYSQL_PORT: "53306"
@@ -124,20 +136,64 @@ jobs:
           PGSERVICE: connector
         run: |
           set -euo pipefail
-          export MSYS2_ARG_CONV_EXCL="/CN"
+
+          cat > "$PGDATA/ca.cnf" <<'EOF'
+          [req]
+          distinguished_name = distinguished_name
+          x509_extensions = v3_ca
+          prompt = no
+
+          [distinguished_name]
+          CN = SQL-Connector-Tier1-CA
+
+          [v3_ca]
+          basicConstraints = critical, CA:true
+          keyUsage = critical, keyCertSign, cRLSign
+          subjectKeyIdentifier = hash
+          authorityKeyIdentifier = keyid:always,issuer
+          EOF
+
+          cat > "$PGDATA/server.cnf" <<'EOF'
+          [req]
+          distinguished_name = distinguished_name
+          req_extensions = v3_server
+          prompt = no
+
+          [distinguished_name]
+          CN = localhost
+
+          [v3_server]
+          basicConstraints = critical, CA:false
+          keyUsage = critical, digitalSignature, keyEncipherment
+          extendedKeyUsage = serverAuth
+          subjectAltName = @subject_alt_name
+
+          [subject_alt_name]
+          DNS.1 = localhost
+          IP.1 = 127.0.0.1
+          EOF
+
+          cat > "$PGDATA/client.cnf" <<EOF
+          [req]
+          distinguished_name = distinguished_name
+          req_extensions = v3_client
+          prompt = no
+
+          [distinguished_name]
+          CN = $TIER1_CLIENT_USERNAME
+
+          [v3_client]
+          basicConstraints = critical, CA:false
+          keyUsage = critical, digitalSignature, keyEncipherment
+          extendedKeyUsage = clientAuth
+          EOF
 
           openssl req -new -x509 -newkey rsa:2048 -nodes -days 1 -sha256 \
-            -subj "/CN=SQL-Connector-Tier1-CA" \
-            -addext "basicConstraints=critical,CA:TRUE" \
-            -addext "keyUsage=critical,keyCertSign,cRLSign" \
+            -config "$PGDATA/ca.cnf" \
             -keyout "$PGDATA/ca.key" \
             -out "$PGDATA/ca.crt"
           openssl req -new -newkey rsa:2048 -nodes -sha256 \
-            -subj "/CN=localhost" \
-            -addext "basicConstraints=critical,CA:FALSE" \
-            -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
-            -addext "extendedKeyUsage=serverAuth" \
-            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+            -config "$PGDATA/server.cnf" \
             -keyout "$PGDATA/server.key" \
             -out "$PGDATA/server.csr"
           openssl x509 -req -days 1 -sha256 \
@@ -145,21 +201,39 @@ jobs:
             -CA "$PGDATA/ca.crt" \
             -CAkey "$PGDATA/ca.key" \
             -CAcreateserial \
-            -copy_extensions copy \
+            -extfile "$PGDATA/server.cnf" \
+            -extensions v3_server \
             -out "$PGDATA/server.crt"
+          openssl req -new -newkey rsa:2048 -nodes -sha256 \
+            -config "$PGDATA/client.cnf" \
+            -keyout "$PGDATA/client.key" \
+            -out "$PGDATA/client.csr"
+          openssl x509 -req -days 1 -sha256 \
+            -in "$PGDATA/client.csr" \
+            -CA "$PGDATA/ca.crt" \
+            -CAkey "$PGDATA/ca.key" \
+            -CAserial "$PGDATA/ca.srl" \
+            -extfile "$PGDATA/client.cnf" \
+            -extensions v3_client \
+            -out "$PGDATA/client.crt"
           chmod og-rwx \
             "$PGDATA/ca.key" \
             "$PGDATA/ca.crt" \
             "$PGDATA/server.key" \
-            "$PGDATA/server.crt"
+            "$PGDATA/server.crt" \
+            "$PGDATA/client.key" \
+            "$PGDATA/client.crt"
           openssl verify -CAfile "$PGDATA/ca.crt" \
-            -purpose sslserver -verify_hostname localhost "$PGDATA/server.crt"
+            -purpose sslserver "$PGDATA/server.crt"
           openssl verify -CAfile "$PGDATA/ca.crt" \
-            -purpose sslserver -verify_ip 127.0.0.1 "$PGDATA/server.crt"
+            -purpose sslclient "$PGDATA/client.crt"
+
+          printf "ssl_ca_file = 'ca.crt'\n" >> "$PGDATA/postgresql.conf"
 
           service_tmp="$PGDATA/pg_service.conf.tls"
           while IFS= read -r line; do
             case "$line" in
+              sslmode=*) printf 'sslmode=verify-full\n' ;;
               sslrootcert=*) printf 'sslrootcert=%s/ca.crt\n' "$PGDATA" ;;
               *) printf '%s\n' "$line" ;;
             esac
@@ -168,9 +242,10 @@ jobs:
 
           hba_tmp="$PGDATA/pg_hba.conf.tls"
           {
-            printf '%s\n' \
-              'hostnossl all all 0.0.0.0/0 reject' \
-              'hostnossl all all ::0/0 reject'
+            printf '%s\n' 'hostnossl all all 0.0.0.0/0 reject'
+            printf '%s\n' 'hostnossl all all ::0/0 reject'
+            printf 'hostssl all %s 0.0.0.0/0 cert\n' "$TIER1_CLIENT_USERNAME"
+            printf 'hostssl all %s ::0/0 cert\n' "$TIER1_CLIENT_USERNAME"
             cat "$PGDATA/pg_hba.conf"
           } > "$hba_tmp"
           mv "$hba_tmp" "$PGDATA/pg_hba.conf"
@@ -199,7 +274,48 @@ jobs:
         run: |
           set -euo pipefail
           ca_file="$MYSQL_BASE_DIR/var/ca.pem"
+          ca_key="$MYSQL_BASE_DIR/var/ca-key.pem"
+          client_config="$MYSQL_BASE_DIR/var/tier1-client.cnf"
+          client_request="$MYSQL_BASE_DIR/var/tier1-client.csr"
+          client_cert="$MYSQL_BASE_DIR/var/tier1-client-cert.pem"
+          client_key="$MYSQL_BASE_DIR/var/tier1-client-key.pem"
           test -s "$ca_file"
+          test -s "$ca_key"
+
+          cat > "$client_config" <<EOF
+          [req]
+          distinguished_name = distinguished_name
+          req_extensions = v3_client
+          prompt = no
+
+          [distinguished_name]
+          CN = $TIER1_CLIENT_USERNAME
+
+          [v3_client]
+          basicConstraints = critical, CA:false
+          keyUsage = critical, digitalSignature, keyEncipherment
+          extendedKeyUsage = clientAuth
+          EOF
+
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+            -out "$client_key"
+          openssl req -new -sha256 \
+            -config "$client_config" \
+            -key "$client_key" \
+            -out "$client_request"
+          openssl x509 -req -days 1 -sha256 \
+            -in "$client_request" \
+            -CA "$ca_file" \
+            -CAkey "$ca_key" \
+            -CAserial "$MYSQL_BASE_DIR/var/tier1-ca.srl" \
+            -CAcreateserial \
+            -extfile "$client_config" \
+            -extensions v3_client \
+            -out "$client_cert"
+
+          [[ "$(sed -n '1p' "$client_key" | tr -d '\r')" == "-----BEGIN PRIVATE KEY-----" ]]
+          openssl pkey -in "$client_key" -check -noout
+          openssl verify -CAfile "$ca_file" -purpose sslclient "$client_cert"
 
           mysql --protocol=TCP --host=127.0.0.1 --port="$TIER1_MYSQL_PORT" \
             --user=root --ssl-mode=VERIFY_IDENTITY --ssl-ca="$ca_file" \
@@ -298,6 +414,44 @@ jobs:
             --user=root --ssl-mode=VERIFY_IDENTITY \
             --ssl-ca="$MYSQL_BASE_DIR/var/ca.pem" < scripts/tier1/mysql.sql
 
+      - name: Verify PostgreSQL client-certificate enforcement
+        if: matrix.engine == 'postgres'
+        shell: bash
+        env:
+          PGDATA: ${{ runner.temp }}/pgdata
+        run: |
+          set -euo pipefail
+          if PGPASSWORD='' psql --no-psqlrc \
+            --dbname="host=localhost port=$TIER1_POSTGRES_PORT user=$TIER1_CLIENT_USERNAME dbname=$TIER1_DATABASE sslmode=verify-full sslrootcert=$PGDATA/ca.crt" \
+            --command='SELECT 1' >/dev/null 2>&1; then
+            echo "PostgreSQL client-certificate account accepted a connection without a certificate" >&2
+            exit 1
+          fi
+          PGSSLCERT="$PGDATA/client.crt" PGSSLKEY="$PGDATA/client.key" psql --no-psqlrc \
+            --dbname="host=localhost port=$TIER1_POSTGRES_PORT user=$TIER1_CLIENT_USERNAME dbname=$TIER1_DATABASE sslmode=verify-full sslrootcert=$PGDATA/ca.crt" \
+            --command='SELECT 1' >/dev/null
+
+      - name: Verify MySQL client-certificate enforcement
+        if: matrix.engine == 'mysql'
+        shell: bash
+        env:
+          MYSQL_BASE_DIR: ${{ steps.mysql.outputs.base-dir }}
+        run: |
+          set -euo pipefail
+          ca_file="$MYSQL_BASE_DIR/var/ca.pem"
+          if mysql --protocol=TCP --host=127.0.0.1 --port="$TIER1_MYSQL_PORT" \
+            --user="$TIER1_CLIENT_USERNAME" --ssl-mode=VERIFY_IDENTITY \
+            --ssl-ca="$ca_file" --execute='SELECT 1' >/dev/null 2>&1; then
+            echo "MySQL client-certificate account accepted a connection without a certificate" >&2
+            exit 1
+          fi
+          mysql --protocol=TCP --host=127.0.0.1 --port="$TIER1_MYSQL_PORT" \
+            --user="$TIER1_CLIENT_USERNAME" --ssl-mode=VERIFY_IDENTITY \
+            --ssl-ca="$ca_file" \
+            --ssl-cert="$MYSQL_BASE_DIR/var/tier1-client-cert.pem" \
+            --ssl-key="$MYSQL_BASE_DIR/var/tier1-client-key.pem" \
+            --execute='SELECT 1' >/dev/null
+
       - name: Build SQL Connector worker
         shell: bash
         run: cargo +1.96.1 build --locked -p sql-connector
@@ -355,4 +509,46 @@ jobs:
           cargo +1.96.1 test --locked -p connector-mcp
           --test mysql_live
           mysql_binary_parameters_and_bounded_writes_work_over_mcp
+          -- --exact --ignored --nocapture
+
+      - name: Run PostgreSQL authentication and credential-boundary live test
+        if: matrix.engine == 'postgres'
+        shell: bash
+        env:
+          SQL_CONNECTOR_TIER1_ENGINE: postgres
+          SQL_CONNECTOR_POSTGRES_E2E_ENDPOINT: postgresql://localhost:55432
+          SQL_CONNECTOR_POSTGRES_E2E_DATABASE: ${{ env.TIER1_DATABASE }}
+          SQL_CONNECTOR_POSTGRES_E2E_USERNAME: ${{ env.TIER1_USERNAME }}
+          SQL_CONNECTOR_POSTGRES_E2E_PASSWORD: ${{ env.TIER1_PASSWORD }}
+          SQL_CONNECTOR_POSTGRES_E2E_CLIENT_USERNAME: ${{ env.TIER1_CLIENT_USERNAME }}
+          SQL_CONNECTOR_POSTGRES_E2E_CA_CERTIFICATE_FILE: ${{ runner.temp }}/pgdata/ca.crt
+          SQL_CONNECTOR_POSTGRES_E2E_CLIENT_CERTIFICATE_FILE: ${{ runner.temp }}/pgdata/client.crt
+          SQL_CONNECTOR_POSTGRES_E2E_CLIENT_PRIVATE_KEY_FILE: ${{ runner.temp }}/pgdata/client.key
+          SQL_CONNECTOR_POSTGRES_E2E_TLS_SERVER_NAME: localhost
+          SQL_CONNECTOR_POSTGRES_E2E_EXPECTED_VERSION_PREFIX: PostgreSQL ${{ matrix.version }}.
+        run: >-
+          cargo +1.96.1 test --locked -p sql-connector
+          --test tier1_auth_live
+          all_advertised_authentication_and_secret_boundaries_work_through_cli_and_mcp
+          -- --exact --ignored --nocapture
+
+      - name: Run MySQL authentication and credential-boundary live test
+        if: matrix.engine == 'mysql'
+        shell: bash
+        env:
+          SQL_CONNECTOR_TIER1_ENGINE: mysql
+          SQL_CONNECTOR_MYSQL_E2E_ENDPOINT: mysql://127.0.0.1:53306
+          SQL_CONNECTOR_MYSQL_E2E_DATABASE: ${{ env.TIER1_DATABASE }}
+          SQL_CONNECTOR_MYSQL_E2E_USERNAME: ${{ env.TIER1_USERNAME }}
+          SQL_CONNECTOR_MYSQL_E2E_PASSWORD: ${{ env.TIER1_PASSWORD }}
+          SQL_CONNECTOR_MYSQL_E2E_CLIENT_USERNAME: ${{ env.TIER1_CLIENT_USERNAME }}
+          SQL_CONNECTOR_MYSQL_E2E_CA_CERTIFICATE_FILE: ${{ steps.mysql.outputs.base-dir }}/var/ca.pem
+          SQL_CONNECTOR_MYSQL_E2E_CLIENT_CERTIFICATE_FILE: ${{ steps.mysql.outputs.base-dir }}/var/tier1-client-cert.pem
+          SQL_CONNECTOR_MYSQL_E2E_CLIENT_PRIVATE_KEY_FILE: ${{ steps.mysql.outputs.base-dir }}/var/tier1-client-key.pem
+          SQL_CONNECTOR_MYSQL_E2E_TLS_SERVER_NAME: "127.0.0.1"
+          SQL_CONNECTOR_MYSQL_E2E_EXPECTED_VERSION_PREFIX: ${{ matrix.version }}.
+        run: >-
+          cargo +1.96.1 test --locked -p sql-connector
+          --test tier1_auth_live
+          all_advertised_authentication_and_secret_boundaries_work_through_cli_and_mcp
           -- --exact --ignored --nocapture

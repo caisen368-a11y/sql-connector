@@ -47,6 +47,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+sha2.workspace = true
 tempfile = "3.23.0"
 
 [lints]

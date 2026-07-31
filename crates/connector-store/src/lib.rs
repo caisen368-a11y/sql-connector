@@ -5,7 +5,8 @@ mod credential;
 mod profile;
 
 pub use audit::{
-    AuditEvent, AuditQuery, AuditRepository, IdempotencyReservation, IdempotencyState,
+    AuditEvent, AuditQuery, AuditRepository, GrantNonceConsumption, IdempotencyReservation,
+    IdempotencyState,
 };
 pub use credential::{
     CredentialStore, InMemoryCredentialStore, OsCredentialStore, SqliteCredentialStore,

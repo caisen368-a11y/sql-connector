@@ -56,6 +56,17 @@ jobs:
           timed_out_write_is_unknown_and_its_idempotency_key_is_not_reused
           -- --exact
 
+      - name: Validate persistent grant replay protection
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.96.1 test --locked -p connector-store --test persistence \
+            grant_nonce_consumption -- --nocapture
+          cargo +1.96.1 test --locked -p connector-runtime --test runtime \
+            confirmed_write_grant_cannot_be_replayed_after_runtime_restart -- --exact
+          cargo +1.96.1 test --locked -p connector-runtime --test runtime \
+            authorization_replay_store_failure_does_not_execute_write -- --exact
+
   matrix:
     name: Build Tier 1 matrix
     runs-on: ubuntu-24.04
@@ -115,6 +126,17 @@ jobs:
       - name: Install Rust
         shell: bash
         run: rustup toolchain install 1.96.1 --profile minimal
+
+      - name: Verify persistent grant replay protection on release platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.96.1 test --locked -p connector-store --test persistence \
+            grant_nonce_consumption_is_atomic_across_connections_and_survives_reopen -- --exact
+          cargo +1.96.1 test --locked -p connector-runtime --test runtime \
+            confirmed_write_grant_cannot_be_replayed_after_runtime_restart -- --exact
+          cargo +1.96.1 test --locked -p connector-runtime --test runtime \
+            authorization_replay_store_failure_does_not_execute_write -- --exact
 
       - name: Set up PostgreSQL
         if: matrix.engine == 'postgres'

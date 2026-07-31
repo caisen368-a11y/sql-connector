@@ -14,7 +14,7 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
 #[test]
-fn signed_grant_is_bound_to_arguments_and_single_use() {
+fn signed_grant_is_bound_to_arguments_and_has_stable_replay_identity() {
     let issuer = GrantIssuer::new(SigningKey::generate(&mut OsRng));
     let verifier = GrantVerifier::new(issuer.verifying_key());
     let connection_id = ConnectionId::new();
@@ -51,8 +51,8 @@ fn signed_grant_is_bound_to_arguments_and_single_use() {
         ..context
     };
     assert!(verifier.verify(&grant, &wrong_subject).is_err());
-    verifier.verify(&grant, &context).unwrap();
-    assert!(verifier.verify(&grant, &context).is_err());
+    let verified = verifier.verify(&grant, &context).unwrap();
+    assert_eq!(verifier.verify(&grant, &context).unwrap(), verified);
 }
 
 #[test]

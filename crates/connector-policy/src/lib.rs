@@ -5,7 +5,7 @@ mod policy;
 
 pub use grant::{
     AuthorizationClaims, AuthorizationGrant, GrantIssuer, GrantVerifier, VerificationContext,
-    canonical_arguments_hash,
+    VerifiedAuthorizationGrant, canonical_arguments_hash,
 };
 pub use policy::{Action, PolicyDecision, PolicyEngine};
 

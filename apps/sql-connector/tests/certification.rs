@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 const CERTIFICATION_LEDGER: &str = include_str!("../../../docs/connector-certification.json");
 const REQUIRED_PLATFORMS: [&str; 3] = ["macos-15", "macos-15-intel", "windows-2022"];
-const REQUIRED_TIER1_CHECKS: [&str; 16] = [
+const REQUIRED_TIER1_CHECKS: [&str; 17] = [
     "all_advertised_authentication",
     "bounded_reads",
     "cancellation",
@@ -19,6 +19,7 @@ const REQUIRED_TIER1_CHECKS: [&str; 16] = [
     "encrypted_credential_boundary",
     "error_classification",
     "native_operations",
+    "persistent_grant_replay_protection",
     "secret_non_disclosure",
     "test_connection",
     "tls_client_certificate",

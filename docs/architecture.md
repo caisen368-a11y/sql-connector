@@ -50,7 +50,9 @@ Profiles default to read-only: native reads and writes are disabled, no
 resource is writable, and bounded limits are mandatory. Signed grants expire
 within 120 seconds, are single-use, and bind the session, connection, MCP tool,
 canonical argument hash, policy version, and limits. They do not override a
-policy denial.
+policy denial. Grant nonce consumption is committed atomically to `audit.sqlite`
+before a database write, so reuse is rejected across MCP process restarts and
+parallel instances that share the same data directory.
 
 ## Operation lifecycle
 

@@ -72,6 +72,13 @@ pub enum IdempotencyReservation {
     KeyConflict,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantNonceConsumption {
+    Consumed,
+    Replayed,
+    Expired,
+}
+
 impl Default for AuditQuery {
     fn default() -> Self {
         Self {
@@ -113,7 +120,9 @@ impl AuditRepository {
     fn migrate(&self) -> Result<()> {
         let connection = self.connection.lock().expect("audit database poisoned");
         connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS audit_events (
+            "PRAGMA busy_timeout=5000;
+             PRAGMA journal_mode=WAL;
+             CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     request_id TEXT NOT NULL,
                     timestamp TEXT NOT NULL,
@@ -157,9 +166,49 @@ impl AuditRepository {
                 state TEXT NOT NULL CHECK (state IN ('in_flight', 'succeeded', 'unknown')),
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(connection_id, idempotency_key)
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS authorization_grant_nonces (
+                replay_key BLOB PRIMARY KEY CHECK(length(replay_key) = 32),
+                expires_at_millis INTEGER NOT NULL,
+                consumed_at_millis INTEGER NOT NULL
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS idx_authorization_grant_nonces_expiry
+                ON authorization_grant_nonces(expires_at_millis);",
         )?;
         Ok(())
+    }
+
+    /// Atomically consume a verified grant nonce across every MCP process using this database.
+    pub fn consume_grant_nonce(
+        &self,
+        replay_key: &[u8; 32],
+        expires_at_millis: i64,
+    ) -> Result<GrantNonceConsumption> {
+        let mut connection = self.connection.lock().expect("audit database poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now_millis = Utc::now().timestamp_millis();
+        transaction.execute(
+            "DELETE FROM authorization_grant_nonces WHERE expires_at_millis <= ?1",
+            [now_millis],
+        )?;
+        let consumption = if expires_at_millis <= now_millis {
+            GrantNonceConsumption::Expired
+        } else {
+            let inserted = transaction.execute(
+                "INSERT INTO authorization_grant_nonces(
+                    replay_key, expires_at_millis, consumed_at_millis
+                 ) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(replay_key) DO NOTHING",
+                params![replay_key.as_slice(), expires_at_millis, now_millis],
+            )?;
+            if inserted == 1 {
+                GrantNonceConsumption::Consumed
+            } else {
+                GrantNonceConsumption::Replayed
+            }
+        };
+        transaction.commit()?;
+        Ok(consumption)
     }
 
     pub fn reserve_idempotency(

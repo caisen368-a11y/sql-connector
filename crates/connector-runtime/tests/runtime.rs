@@ -1,4 +1,12 @@
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use chrono::{TimeDelta, Utc};
@@ -15,11 +23,13 @@ use connector_store::{
     AuditQuery, AuditRepository, CredentialStore, InMemoryCredentialStore, ProfileRepository,
 };
 use ed25519_dalek::SigningKey;
+use rusqlite::Connection as SqliteConnection;
 use url::Url;
 use uuid::Uuid;
 
 struct FakeConnector {
     discover: bool,
+    executions: Option<Arc<AtomicUsize>>,
 }
 
 #[async_trait]
@@ -160,6 +170,9 @@ impl Connector for FakeConnector {
         _secret: &SecretMaterial,
         operation: DataOperation,
     ) -> connector_core::Result<OperationResult> {
+        if let Some(executions) = &self.executions {
+            executions.fetch_add(1, Ordering::SeqCst);
+        }
         if matches!(
             context.request_id.as_str(),
             "client-request-1" | "timeout-write-1"
@@ -243,10 +256,33 @@ fn build_runtime_with_verifier_and_timeout(
     egress: DataEgress,
     timeout_ms: u64,
 ) -> (Runtime, ConnectionId, Arc<AuditRepository>) {
-    let profiles = Arc::new(ProfileRepository::open_in_memory().unwrap());
-    let credentials = Arc::new(InMemoryCredentialStore::default());
     let audit = Arc::new(AuditRepository::open_in_memory().unwrap());
     let connection_id = ConnectionId::new();
+    build_runtime_with_state(
+        discover,
+        resources,
+        grant_verifier,
+        egress,
+        timeout_ms,
+        audit,
+        connection_id,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_runtime_with_state(
+    discover: bool,
+    resources: Vec<ResourceRule>,
+    grant_verifier: Option<Arc<GrantVerifier>>,
+    egress: DataEgress,
+    timeout_ms: u64,
+    audit: Arc<AuditRepository>,
+    connection_id: ConnectionId,
+    executions: Option<Arc<AtomicUsize>>,
+) -> (Runtime, ConnectionId, Arc<AuditRepository>) {
+    let profiles = Arc::new(ProfileRepository::open_in_memory().unwrap());
+    let credentials = Arc::new(InMemoryCredentialStore::default());
     let profile = ConnectionProfile {
         id: connection_id,
         display_name: "test".into(),
@@ -281,7 +317,10 @@ fn build_runtime_with_verifier_and_timeout(
         .unwrap();
     let mut registry = ConnectorRegistry::new();
     registry
-        .register(Arc::new(FakeConnector { discover }))
+        .register(Arc::new(FakeConnector {
+            discover,
+            executions,
+        }))
         .unwrap();
     (
         Runtime::new(
@@ -325,6 +364,36 @@ fn write_authorization(
         arguments,
         grant: Some(grant),
     }
+}
+
+fn writable_resources() -> Vec<ResourceRule> {
+    vec![ResourceRule {
+        pattern: "public.*".into(),
+        allow_read: true,
+        allow_insert: true,
+        allow_update: false,
+        allow_delete: false,
+        masked_fields: Vec::new(),
+    }]
+}
+
+fn build_persistent_write_runtime(
+    audit_path: &Path,
+    connection_id: ConnectionId,
+    verifier: Arc<GrantVerifier>,
+    executions: Arc<AtomicUsize>,
+) -> Runtime {
+    build_runtime_with_state(
+        false,
+        writable_resources(),
+        Some(verifier),
+        DataEgress::LocalOnly,
+        30_000,
+        Arc::new(AuditRepository::open(audit_path).unwrap()),
+        connection_id,
+        Some(executions),
+    )
+    .0
 }
 
 #[test]
@@ -962,6 +1031,99 @@ async fn successful_write_idempotency_key_is_not_executed_twice() {
             if error.category == connector_core::ErrorCategory::Conflict
                 && error.code.as_deref() == Some("idempotency_key_conflict")
     ));
+}
+
+#[tokio::test]
+async fn confirmed_write_grant_cannot_be_replayed_after_runtime_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let audit_path = directory.path().join("audit.sqlite");
+    let issuer = GrantIssuer::new(SigningKey::from_bytes(&[11; 32]));
+    let connection_id = ConnectionId::new();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let operation = DataOperation::Insert(InsertRequest {
+        target: "public.items".into(),
+        records: vec![DbRecord::from([("id".into(), DbValue::Int64(1))])],
+        idempotency_key: None,
+    });
+    let authorization =
+        write_authorization(&issuer, connection_id, &operation, "persistent-write-grant");
+
+    let first_runtime = build_persistent_write_runtime(
+        &audit_path,
+        connection_id,
+        Arc::new(GrantVerifier::new(issuer.verifying_key())),
+        Arc::clone(&executions),
+    );
+    first_runtime
+        .execute(connection_id, operation.clone(), authorization.clone())
+        .await
+        .unwrap();
+    drop(first_runtime);
+
+    let restarted_runtime = build_persistent_write_runtime(
+        &audit_path,
+        connection_id,
+        Arc::new(GrantVerifier::new(issuer.verifying_key())),
+        Arc::clone(&executions),
+    );
+    let error = restarted_runtime
+        .execute(connection_id, operation, authorization)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeError::Policy(connector_policy::PolicyError::Replayed)
+    ));
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn authorization_replay_store_failure_does_not_execute_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let audit_path = directory.path().join("audit.sqlite");
+    let issuer = GrantIssuer::new(SigningKey::from_bytes(&[13; 32]));
+    let connection_id = ConnectionId::new();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let runtime = build_persistent_write_runtime(
+        &audit_path,
+        connection_id,
+        Arc::new(GrantVerifier::new(issuer.verifying_key())),
+        Arc::clone(&executions),
+    );
+    SqliteConnection::open(&audit_path)
+        .unwrap()
+        .execute("DROP TABLE authorization_grant_nonces", [])
+        .unwrap();
+    let operation = DataOperation::Insert(InsertRequest {
+        target: "public.items".into(),
+        records: vec![DbRecord::from([("id".into(), DbValue::Int64(1))])],
+        idempotency_key: None,
+    });
+
+    let error = runtime
+        .execute(
+            connection_id,
+            operation.clone(),
+            write_authorization(
+                &issuer,
+                connection_id,
+                &operation,
+                "unavailable-replay-store-grant",
+            ),
+        )
+        .await
+        .unwrap_err();
+    let RuntimeError::Connector(error) = error else {
+        panic!("a replay-store failure must return an internal connector error");
+    };
+    assert_eq!(error.category, connector_core::ErrorCategory::Internal);
+    assert_eq!(error.phase, connector_core::ErrorPhase::Authorization);
+    assert_eq!(
+        error.code.as_deref(),
+        Some("authorization_replay_store_unavailable")
+    );
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

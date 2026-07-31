@@ -1,5 +1,3 @@
-use std::{collections::HashMap, sync::Mutex};
-
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, TimeDelta, Utc};
 use connector_core::ConnectionId;
@@ -10,6 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::{PolicyError, Result};
 
 const MAX_GRANT_LIFETIME_SECONDS: i64 = 120;
+const GRANT_REPLAY_KEY_DOMAIN: &[u8] = b"sql-connector/authorization-grant-replay/v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationClaims {
@@ -30,6 +29,23 @@ pub struct AuthorizationClaims {
 pub struct AuthorizationGrant {
     pub claims: AuthorizationClaims,
     pub signature: String,
+}
+
+/// Opaque replay identity returned only after a grant passes every verification check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedAuthorizationGrant {
+    replay_key: [u8; 32],
+    expires_at_millis: i64,
+}
+
+impl VerifiedAuthorizationGrant {
+    pub const fn replay_key(&self) -> &[u8; 32] {
+        &self.replay_key
+    }
+
+    pub const fn expires_at_millis(&self) -> i64 {
+        self.expires_at_millis
+    }
 }
 
 pub struct GrantIssuer {
@@ -70,22 +86,18 @@ pub struct VerificationContext<'a> {
 
 pub struct GrantVerifier {
     verifying_key: VerifyingKey,
-    used_nonces: Mutex<HashMap<String, DateTime<Utc>>>,
 }
 
 impl GrantVerifier {
     pub fn new(verifying_key: VerifyingKey) -> Self {
-        Self {
-            verifying_key,
-            used_nonces: Mutex::new(HashMap::new()),
-        }
+        Self { verifying_key }
     }
 
     pub fn verify(
         &self,
         grant: &AuthorizationGrant,
         context: &VerificationContext<'_>,
-    ) -> Result<()> {
+    ) -> Result<VerifiedAuthorizationGrant> {
         let signature_bytes = URL_SAFE_NO_PAD
             .decode(&grant.signature)
             .map_err(|error| PolicyError::InvalidGrant(error.to_string()))?;
@@ -131,16 +143,20 @@ impl GrantVerifier {
             return Err(PolicyError::GrantMismatch("limits".into()));
         }
 
-        let mut used_nonces = self.used_nonces.lock().expect("nonce cache poisoned");
-        used_nonces.retain(|_, expires_at| *expires_at > now);
-        if used_nonces
-            .insert(grant.claims.nonce.clone(), grant.claims.expires_at)
-            .is_some()
-        {
-            return Err(PolicyError::Replayed);
-        }
-        Ok(())
+        let replay_key = grant_replay_key(&self.verifying_key, &grant.claims.nonce);
+        Ok(VerifiedAuthorizationGrant {
+            replay_key,
+            expires_at_millis: grant.claims.expires_at.timestamp_millis(),
+        })
     }
+}
+
+fn grant_replay_key(verifying_key: &VerifyingKey, nonce: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(GRANT_REPLAY_KEY_DOMAIN);
+    digest.update(verifying_key.as_bytes());
+    digest.update(nonce.as_bytes());
+    digest.finalize().into()
 }
 
 pub fn canonical_arguments_hash(arguments: &serde_json::Value) -> Result<String> {

@@ -8,16 +8,17 @@ use chrono::Utc;
 use connector_core::{
     Capability, CatalogEntity, CatalogPage, CatalogQuery, ConnectionCapabilities, ConnectionId,
     ConnectionInfo, ConnectorContext, ConnectorDescriptor, ConnectorError, ConnectorManifest,
-    DataEgress, DataOperation, DbValue, EntityDescription, ErrorCategory, OperationResult,
-    SanitizedConnection, TIME_SERIES_QUERY_POLICY_TARGET, validate_expected_version,
+    DataEgress, DataOperation, DbValue, EntityDescription, ErrorCategory, ErrorPhase,
+    OperationResult, SanitizedConnection, TIME_SERIES_QUERY_POLICY_TARGET,
+    validate_expected_version,
 };
 use connector_policy::{
     Action, AuthorizationGrant, GrantVerifier, PolicyDecision, PolicyEngine, PolicyError,
     VerificationContext, canonical_arguments_hash,
 };
 use connector_store::{
-    AuditEvent, AuditRepository, CredentialStore, IdempotencyReservation, IdempotencyState,
-    ProfileRepository, StoreError,
+    AuditEvent, AuditRepository, CredentialStore, GrantNonceConsumption, IdempotencyReservation,
+    IdempotencyState, ProfileRepository, StoreError,
 };
 use serde_json::Value;
 use tokio::{
@@ -659,8 +660,8 @@ impl Runtime {
                 return Err(error.into());
             }
         };
-        let confirmed = match decision {
-            PolicyDecision::Allow => false,
+        let verified_grant = match decision {
+            PolicyDecision::Allow => None,
             PolicyDecision::Deny => {
                 let error = connector_policy::PolicyError::Denied(
                     policy_denial_reason(&profile.policy, action, &authorization.tool).into(),
@@ -682,50 +683,47 @@ impl Runtime {
                 return Err(error.into());
             }
             PolicyDecision::Confirm => {
-                let verification: connector_policy::Result<()> = (|| {
-                    let grant = authorization
-                        .grant
-                        .as_ref()
-                        .ok_or(connector_policy::PolicyError::ConfirmationRequired)?;
-                    let verifier = self
-                        .grant_verifier
-                        .as_ref()
-                        .ok_or(connector_policy::PolicyError::ConfirmationRequired)?;
-                    verifier.verify(
-                        grant,
-                        &VerificationContext {
-                            subject: &authorization.subject,
-                            session_id: &authorization.session_id,
-                            connection_id,
-                            tool: &authorization.tool,
-                            arguments: &authorization.arguments,
-                            policy_version: profile.policy_version,
-                            max_rows: profile.policy.max_rows,
-                            max_bytes: profile.policy.max_bytes,
-                            max_affected: profile.policy.max_affected,
-                        },
-                    )
-                })();
-                if let Err(error) = verification {
-                    self.record_audit(
-                        &audit_request_id,
-                        &authorization.subject,
-                        &authorization.session_id,
-                        Some(connection_id),
-                        &authorization.tool,
-                        target.as_deref(),
-                        "confirm",
-                        false,
-                        started,
-                        0,
-                        0,
-                        Some(ErrorCategory::PermissionDenied),
-                    );
-                    return Err(error.into());
+                let verification =
+                    match (authorization.grant.as_ref(), self.grant_verifier.as_ref()) {
+                        (Some(grant), Some(verifier)) => verifier.verify(
+                            grant,
+                            &VerificationContext {
+                                subject: &authorization.subject,
+                                session_id: &authorization.session_id,
+                                connection_id,
+                                tool: &authorization.tool,
+                                arguments: &authorization.arguments,
+                                policy_version: profile.policy_version,
+                                max_rows: profile.policy.max_rows,
+                                max_bytes: profile.policy.max_bytes,
+                                max_affected: profile.policy.max_affected,
+                            },
+                        ),
+                        _ => Err(connector_policy::PolicyError::ConfirmationRequired),
+                    };
+                match verification {
+                    Ok(verified_grant) => Some(verified_grant),
+                    Err(error) => {
+                        self.record_audit(
+                            &audit_request_id,
+                            &authorization.subject,
+                            &authorization.session_id,
+                            Some(connection_id),
+                            &authorization.tool,
+                            target.as_deref(),
+                            "confirm",
+                            false,
+                            started,
+                            0,
+                            0,
+                            Some(ErrorCategory::PermissionDenied),
+                        );
+                        return Err(error.into());
+                    }
                 }
-                true
             }
         };
+        let confirmed = verified_grant.is_some();
 
         if profile.policy.egress == DataEgress::CloudAllowedMasked
             && let Err(error) = self.resolve_masked_cursor(
@@ -765,6 +763,52 @@ impl Runtime {
             &authorization.session_id,
             Arc::clone(&connector),
         )?;
+        if let Some(verified_grant) = &verified_grant {
+            let replay_error = match self.audit.consume_grant_nonce(
+                verified_grant.replay_key(),
+                verified_grant.expires_at_millis(),
+            ) {
+                Ok(GrantNonceConsumption::Consumed) => None,
+                Ok(GrantNonceConsumption::Replayed) => {
+                    Some(RuntimeError::Policy(PolicyError::Replayed))
+                }
+                Ok(GrantNonceConsumption::Expired) => {
+                    Some(RuntimeError::Policy(PolicyError::Expired))
+                }
+                Err(error) => {
+                    warn!(
+                        %error,
+                        request_id = %context.request_id,
+                        "failed to persist authorization grant replay protection"
+                    );
+                    Some(RuntimeError::Connector(
+                        ConnectorError::new(
+                            ErrorCategory::Internal,
+                            "authorization replay protection could not be persisted; the write was not sent",
+                        )
+                        .with_phase(ErrorPhase::Authorization)
+                        .with_code("authorization_replay_store_unavailable"),
+                    ))
+                }
+            };
+            if let Some(error) = replay_error {
+                self.record_audit(
+                    &context.request_id,
+                    &authorization.subject,
+                    &authorization.session_id,
+                    Some(connection_id),
+                    &authorization.tool,
+                    target.as_deref(),
+                    decision_name(decision),
+                    false,
+                    started,
+                    0,
+                    0,
+                    Some(runtime_error_category(&error)),
+                );
+                return Err(error);
+            }
+        }
         let idempotency = operation
             .write_idempotency_key()
             .map(|idempotency_key| {

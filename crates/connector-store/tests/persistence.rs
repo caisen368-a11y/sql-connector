@@ -1,4 +1,8 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Barrier},
+    thread,
+};
 
 use chrono::{TimeDelta, Utc};
 use connector_core::{
@@ -6,8 +10,8 @@ use connector_core::{
     ResourceRule, SecretMaterial, TlsConfig,
 };
 use connector_store::{
-    AuditEvent, AuditQuery, AuditRepository, CredentialStore, IdempotencyReservation,
-    IdempotencyState, InMemoryCredentialStore, ProfileRepository,
+    AuditEvent, AuditQuery, AuditRepository, CredentialStore, GrantNonceConsumption,
+    IdempotencyReservation, IdempotencyState, InMemoryCredentialStore, ProfileRepository,
 };
 use rusqlite::Connection;
 use url::Url;
@@ -231,5 +235,106 @@ fn idempotency_reservations_lock_terminal_outcomes_and_release_failures() {
             .reserve_idempotency(connection_id, "write-3", "hash-d")
             .unwrap(),
         IdempotencyReservation::Reserved
+    );
+}
+
+#[test]
+fn grant_nonce_consumption_is_atomic_across_connections_and_survives_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("audit.sqlite");
+    let replay_key = [42_u8; 32];
+    let expires_at_millis = (Utc::now() + TimeDelta::seconds(30)).timestamp_millis();
+    let repositories = (0..4)
+        .map(|_| AuditRepository::open(&path).unwrap())
+        .collect::<Vec<_>>();
+    let barrier = Arc::new(Barrier::new(repositories.len()));
+
+    let handles = repositories
+        .into_iter()
+        .map(|repository| {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                repository
+                    .consume_grant_nonce(&replay_key, expires_at_millis)
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == GrantNonceConsumption::Consumed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == GrantNonceConsumption::Replayed)
+            .count(),
+        3
+    );
+    let reopened = AuditRepository::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .consume_grant_nonce(&replay_key, expires_at_millis)
+            .unwrap(),
+        GrantNonceConsumption::Replayed
+    );
+}
+
+#[test]
+fn grant_nonce_consumption_rejects_expired_grants_and_removes_expired_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("audit.sqlite");
+    let expired_key = [7_u8; 32];
+    let future_key = [8_u8; 32];
+    let now_millis = Utc::now().timestamp_millis();
+    let future_expires_at_millis = now_millis + 60_000;
+    let repository = AuditRepository::open(&path).unwrap();
+
+    assert_eq!(
+        repository
+            .consume_grant_nonce(&expired_key, now_millis - 1)
+            .unwrap(),
+        GrantNonceConsumption::Expired
+    );
+    assert_eq!(
+        repository
+            .consume_grant_nonce(&future_key, future_expires_at_millis)
+            .unwrap(),
+        GrantNonceConsumption::Consumed
+    );
+    drop(repository);
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO authorization_grant_nonces(
+                replay_key, expires_at_millis, consumed_at_millis
+             ) VALUES (?1, ?2, ?3)",
+            rusqlite::params![expired_key.as_slice(), now_millis - 1, now_millis - 2],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = AuditRepository::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .consume_grant_nonce(&expired_key, now_millis + 30_000)
+            .unwrap(),
+        GrantNonceConsumption::Consumed
+    );
+    assert_eq!(
+        reopened
+            .consume_grant_nonce(&future_key, future_expires_at_millis)
+            .unwrap(),
+        GrantNonceConsumption::Replayed
     );
 }

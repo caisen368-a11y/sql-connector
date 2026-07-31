@@ -20,6 +20,8 @@ uuid.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 ed25519-dalek.workspace = true
+rusqlite.workspace = true
+tempfile = "3.23.0"
 url.workspace = true
 
 [lints]

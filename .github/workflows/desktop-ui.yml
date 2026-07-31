@@ -15,7 +15,7 @@ on:
       - ".github/workflows/desktop-ui.yml"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   package:
@@ -92,27 +92,22 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/ui-v')
     needs: package
     runs-on: ubuntu-24.04
-    permissions:
-      actions: read
-      contents: write
 
     steps:
       - name: Download desktop packages
         uses: actions/download-artifact@v4
         with:
-          path: release-assets
+          path: dist
+          merge-multiple: true
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          version="${GITHUB_REF_NAME#ui-}"
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" release-assets/*/* --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" release-assets/*/* \
-              --verify-tag \
-              --title "SQL Agent $version" \
-              --generate-notes
-          fi
+          release_tag="${GITHUB_REF_NAME%-publish}"
+          version="${release_tag#ui-}"
+          gh release create "$release_tag" dist/* \
+            --verify-tag \
+            --title "SQL Agent $version" \
+            --generate-notes

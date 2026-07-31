@@ -448,14 +448,17 @@ jobs:
           PGDATA: ${{ runner.temp }}/pgdata
         run: |
           set -euo pipefail
-          if PGPASSWORD='' psql --no-psqlrc \
-            --dbname="host=localhost port=$TIER1_POSTGRES_PORT user=$TIER1_CLIENT_USERNAME dbname=$TIER1_DATABASE sslmode=verify-full sslrootcert=$PGDATA/ca.crt" \
+          if PGSSLROOTCERT="$PGDATA/ca.crt" PGPASSWORD='' psql --no-psqlrc \
+            --dbname="host=localhost port=$TIER1_POSTGRES_PORT user=$TIER1_CLIENT_USERNAME dbname=$TIER1_DATABASE sslmode=verify-full" \
             --command='SELECT 1' >/dev/null 2>&1; then
             echo "PostgreSQL client-certificate account accepted a connection without a certificate" >&2
             exit 1
           fi
-          PGSSLCERT="$PGDATA/client.crt" PGSSLKEY="$PGDATA/client.key" psql --no-psqlrc \
-            --dbname="host=localhost port=$TIER1_POSTGRES_PORT user=$TIER1_CLIENT_USERNAME dbname=$TIER1_DATABASE sslmode=verify-full sslrootcert=$PGDATA/ca.crt" \
+          PGSSLROOTCERT="$PGDATA/ca.crt" \
+            PGSSLCERT="$PGDATA/client.crt" \
+            PGSSLKEY="$PGDATA/client.key" \
+            psql --no-psqlrc \
+            --dbname="host=localhost port=$TIER1_POSTGRES_PORT user=$TIER1_CLIENT_USERNAME dbname=$TIER1_DATABASE sslmode=verify-full" \
             --command='SELECT 1' >/dev/null
 
       - name: Verify MySQL client-certificate enforcement

@@ -157,6 +157,16 @@ pub struct McpToolRoute {
     pub fixed_policy_target: Option<String>,
 }
 
+/// One connector tool evaluated against a saved connection's current policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveMcpTool {
+    pub capability: Capability,
+    pub tool: String,
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
 /// Public connector description returned to the desktop host and MCP client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorDescriptor {
@@ -175,6 +185,7 @@ pub struct ConnectionCapabilities {
     pub connection: SanitizedConnection,
     pub policy: ConnectionPolicy,
     pub policy_version: u64,
+    pub effective_mcp_tools: Vec<EffectiveMcpTool>,
 }
 
 impl ConnectorManifest {
@@ -217,6 +228,15 @@ fn mcp_tool_routes(
         routes.push(McpToolRoute {
             capability: Capability::Describe,
             tool: "db_inspect_schema".to_owned(),
+            fixed_policy_target: None,
+        });
+    }
+
+    if target_kind == ResourceTargetKind::SqlRelation && manifest.supports(Capability::NativeQuery)
+    {
+        routes.push(McpToolRoute {
+            capability: Capability::NativeQuery,
+            tool: "sql_query".to_owned(),
             fixed_policy_target: None,
         });
     }

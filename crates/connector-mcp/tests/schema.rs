@@ -24,6 +24,7 @@ fn exposes_discovery_and_all_data_model_tool_families() {
         "db_get_capabilities",
         "db_inspect_schema",
         "sql_read",
+        "sql_query",
         "document_find",
         "kv_read",
         "kv_update",
@@ -48,6 +49,13 @@ fn exposes_discovery_and_all_data_model_tool_families() {
         .unwrap();
     assert_eq!(inspect.input_schema["properties"]["limit"]["default"], 10);
     assert_eq!(inspect.input_schema["properties"]["limit"]["maximum"], 20);
+
+    let sql_query = tools.iter().find(|tool| tool.name == "sql_query").unwrap();
+    let sql_query_schema = serde_json::to_string(&sql_query.input_schema).unwrap();
+    assert!(sql_query_schema.contains("statement"));
+    assert!(sql_query_schema.contains("positional_parameters"));
+    assert!(!sql_query_schema.contains("max_affected"));
+    assert!(!sql_query_schema.contains("idempotency_key"));
 }
 
 #[test]

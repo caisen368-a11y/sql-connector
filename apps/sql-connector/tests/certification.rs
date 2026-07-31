@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 const CERTIFICATION_LEDGER: &str = include_str!("../../../docs/connector-certification.json");
 const REQUIRED_PLATFORMS: [&str; 3] = ["macos-15", "macos-15-intel", "windows-2022"];
-const REQUIRED_TIER1_CHECKS: [&str; 17] = [
+const REQUIRED_TIER1_CHECKS: [&str; 18] = [
     "all_advertised_authentication",
     "bounded_reads",
     "cancellation",
@@ -19,6 +19,7 @@ const REQUIRED_TIER1_CHECKS: [&str; 17] = [
     "encrypted_credential_boundary",
     "error_classification",
     "native_operations",
+    "policy_scoped_sql_query",
     "persistent_grant_replay_protection",
     "secret_non_disclosure",
     "test_connection",
@@ -97,6 +98,12 @@ fn verified_status_without_evidence_is_rejected() {
     let error = validate_certification(&manifests, &ledger).unwrap_err();
 
     assert!(error.contains("has no certification evidence"));
+}
+
+#[test]
+#[ignore = "operator helper for recording Tier 1 certification evidence"]
+fn print_tier1_source_fingerprint() {
+    println!("{}", tier1_source_fingerprint());
 }
 
 fn load_manifests() -> Vec<ConnectorManifest> {
@@ -590,12 +597,20 @@ fn tier1_source_fingerprint() -> String {
         hasher.update(path.as_bytes());
         let source = String::from_utf8_lossy(source)
             .replace(
-                "status: ConnectorStatus::Experimental",
-                "status: ConnectorStatus::CertificationState",
+                "const MYSQL_TIER1_STATUS: ConnectorStatus = ConnectorStatus::Experimental;",
+                "const MYSQL_TIER1_STATUS: ConnectorStatus = ConnectorStatus::CertificationState;",
             )
             .replace(
-                "status: ConnectorStatus::Verified",
-                "status: ConnectorStatus::CertificationState",
+                "const MYSQL_TIER1_STATUS: ConnectorStatus = ConnectorStatus::Verified;",
+                "const MYSQL_TIER1_STATUS: ConnectorStatus = ConnectorStatus::CertificationState;",
+            )
+            .replace(
+                "const POSTGRES_TIER1_STATUS: ConnectorStatus = ConnectorStatus::Experimental;",
+                "const POSTGRES_TIER1_STATUS: ConnectorStatus = ConnectorStatus::CertificationState;",
+            )
+            .replace(
+                "const POSTGRES_TIER1_STATUS: ConnectorStatus = ConnectorStatus::Verified;",
+                "const POSTGRES_TIER1_STATUS: ConnectorStatus = ConnectorStatus::CertificationState;",
             );
         hasher.update(source.len().to_le_bytes());
         hasher.update(source.as_bytes());

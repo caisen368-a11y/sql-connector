@@ -17,17 +17,15 @@ import ReactMarkdown from "react-markdown";
 import type {
   Connection,
   Conversation,
-  McpStatus,
   RunStatus,
   ToolApproval,
   ToolRun,
 } from "../types";
-import { ErrorNotice, JsonPreview, McpIndicator } from "./Common";
+import { ErrorNotice, JsonPreview } from "./Common";
 
 interface ChatViewProps {
   conversation: Conversation | null;
   connections: Connection[];
-  mcp: McpStatus;
   runStatus: RunStatus;
   runError?: string | null;
   approvals: ToolApproval[];
@@ -205,7 +203,6 @@ function ApprovalCard({
 export function ChatView({
   conversation,
   connections,
-  mcp,
   runStatus,
   runError,
   approvals,
@@ -314,10 +311,7 @@ export function ChatView({
       <header className="chat-header" data-tauri-drag-region>
         <div className="chat-heading" data-tauri-drag-region>
           <h1>{conversation?.title || "新对话"}</h1>
-          <div className="chat-context">
-            <McpIndicator mcp={mcp} showLabel={false} />
-            <span>{egressLabel(selectedConnection)}</span>
-          </div>
+          <div className="chat-context">{egressLabel(selectedConnection)}</div>
         </div>
         <div className="connection-picker-wrap">
           <Database size={15} />

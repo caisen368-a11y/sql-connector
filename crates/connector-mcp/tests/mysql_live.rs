@@ -140,7 +140,41 @@ async fn mysql_binary_parameters_and_bounded_writes_work_over_mcp() {
     untrusted_client.cancel().await.unwrap();
     untrusted_server_task.await.unwrap();
 
-    let (runtime, confirmation) = build_runtime(&profile, &secret, connector);
+    let mut wrong_host_profile = profile.clone();
+    wrong_host_profile.id = ConnectionId::new();
+    wrong_host_profile.secret_ref = format!("connection/{}", wrong_host_profile.id);
+    wrong_host_profile.tls.server_name = Some("wrong-host.invalid".into());
+    wrong_host_profile.policy.timeout_ms = 5_000;
+    let (wrong_host_runtime, _) =
+        build_runtime(&wrong_host_profile, &secret, Arc::clone(&connector));
+    let (wrong_host_server_transport, wrong_host_client_transport) = tokio::io::duplex(64 * 1024);
+    let wrong_host_server_task = tokio::spawn(async move {
+        DatabaseMcpServer::with_identity(wrong_host_runtime, SUBJECT, SESSION_ID)
+            .serve(wrong_host_server_transport)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap();
+    });
+    let wrong_host_client = ().serve(wrong_host_client_transport).await.unwrap();
+    let rejected = wrong_host_client
+        .call_tool(tool_params(
+            "db_test_connection",
+            &json!({"connection_id": wrong_host_profile.id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rejected.is_error, Some(true));
+    let rejected = rejected.structured_content.unwrap();
+    assert_eq!(rejected["error"]["code"], "unavailable");
+    assert_eq!(rejected["error"]["phase"], "tls");
+    assert_eq!(rejected["error"]["message"], "MySQL TLS handshake failed");
+    assert_eq!(rejected["error"]["retryable"], false);
+    wrong_host_client.cancel().await.unwrap();
+    wrong_host_server_task.await.unwrap();
+
+    let (runtime, confirmation) = build_runtime(&profile, &secret, Arc::clone(&connector));
 
     let (server_transport, client_transport) = tokio::io::duplex(256 * 1024);
     let server_task = tokio::spawn(async move {
@@ -336,6 +370,71 @@ async fn mysql_binary_parameters_and_bounded_writes_work_over_mcp() {
             .unwrap(),
     );
     assert_eq!(inserted["metrics"]["affected"], 3);
+
+    let mut scoped_profile = profile.clone();
+    scoped_profile.id = ConnectionId::new();
+    scoped_profile.secret_ref = format!("connection/{}", scoped_profile.id);
+    scoped_profile.policy.allow_native_read = false;
+    let scoped_connection_id = scoped_profile.id.to_string();
+    let (scoped_runtime, _) = build_runtime(&scoped_profile, &secret, Arc::clone(&connector));
+    let (scoped_server_transport, scoped_client_transport) = tokio::io::duplex(128 * 1024);
+    let scoped_server_task = tokio::spawn(async move {
+        DatabaseMcpServer::with_identity(scoped_runtime, SUBJECT, SESSION_ID)
+            .serve(scoped_server_transport)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap();
+    });
+    let scoped_client = ().serve(scoped_client_transport).await.unwrap();
+    let scoped_capabilities = success(
+        scoped_client
+            .call_tool(tool_params(
+                "db_get_capabilities",
+                &json!({"connection_id": scoped_connection_id}),
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        scoped_capabilities["effective_mcp_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["tool"] == "sql_query" && tool["available"] == true)
+    );
+    assert!(
+        scoped_capabilities["effective_mcp_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["tool"] == "native_query" && tool["available"] == false)
+    );
+    let joined = success(
+        scoped_client
+            .call_tool(tool_params(
+                "sql_query",
+                &json!({
+                    "connection_id": scoped_connection_id,
+                    "request_id": "mysql-policy-query-1",
+                    "request": {
+                        "language": "mysql",
+                        "statement": format!(
+                            "SELECT o.id AS owner_id, COUNT(i.id) AS item_count FROM `{database}`.`owners` o JOIN `{database}`.`items` i ON i.owner_id = o.id GROUP BY o.id"
+                        ),
+                        "parameters": {},
+                        "positional_parameters": []
+                    }
+                }),
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(joined["records"][0]["owner_id"]["value"], 1);
+    assert_eq!(joined["records"][0]["item_count"]["value"], 3);
+    scoped_client.cancel().await.unwrap();
+    scoped_server_task.await.unwrap();
 
     let first_page = success(
         client
@@ -595,7 +694,56 @@ async fn mysql_binary_parameters_and_bounded_writes_work_over_mcp() {
     assert_eq!(recovered_read["records"].as_array().unwrap().len(), 3);
     assert_eq!(recovered_read["records"][0]["name"]["value"], "published");
 
+    let interrupted_arguments = json!({
+        "connection_id": connection_id,
+        "request_id": "mysql-unknown-outcome-1",
+        "request": {
+            "language": "mysql",
+            "statement": "UPDATE `items` SET `qty` = `qty` + SLEEP(30) WHERE `id` = ?",
+            "parameters": {},
+            "positional_parameters": [{"type": "int64", "value": 1}],
+            "max_affected": 1,
+            "idempotency_key": "mysql-unknown-outcome-key-1"
+        }
+    });
+    let interrupted_params =
+        granted_tool_params(&confirmation, "native_execute", &interrupted_arguments);
+    let interrupted_peer = client.peer().clone();
+    let interrupted_write = tokio::spawn(async move {
+        interrupted_peer
+            .call_tool(interrupted_params)
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
     worker.restart().await.unwrap();
+    let interrupted = timeout(Duration::from_secs(10), interrupted_write)
+        .await
+        .expect("interrupted MySQL write must finish promptly")
+        .unwrap();
+    assert_eq!(interrupted.is_error, Some(true));
+    let interrupted = interrupted.structured_content.unwrap();
+    assert_eq!(interrupted["error"]["code"], "unknown_outcome");
+    assert_eq!(interrupted["error"]["retryable"], false);
+
+    let mut retry_arguments = interrupted_arguments;
+    retry_arguments["request_id"] = json!("mysql-unknown-outcome-retry-1");
+    let retry = timeout(
+        Duration::from_secs(5),
+        client.call_tool(granted_tool_params(
+            &confirmation,
+            "native_execute",
+            &retry_arguments,
+        )),
+    )
+    .await
+    .expect("MySQL unknown-outcome retry must be rejected without execution")
+    .unwrap();
+    assert_eq!(retry.is_error, Some(true));
+    let retry = retry.structured_content.unwrap();
+    assert_eq!(retry["error"]["code"], "unknown_outcome");
+    assert_eq!(retry["error"]["driver_code"], "idempotency_unknown_outcome");
+
     let restarted_connection = success(
         client
             .call_tool(tool_params(

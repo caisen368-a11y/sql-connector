@@ -38,6 +38,7 @@ serde.workspace = true
 serde_json.workspace = true
 tiberius = { version = "=0.12.3", default-features = false, features = ["chrono", "rustls", "tds73", "tokio"] }
 tokio.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 tokio-postgres = { version = "=0.7.15", default-features = false, features = ["runtime"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -46,6 +47,7 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }
 sha2.workspace = true
 tempfile = "3.23.0"

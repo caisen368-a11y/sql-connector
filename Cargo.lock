@@ -648,6 +648,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-util",
  "tracing",
  "url",
  "uuid",
@@ -4379,6 +4380,7 @@ name = "sql-connector"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "clap",
@@ -4408,6 +4410,7 @@ dependencies = [
  "tiberius",
  "tokio",
  "tokio-postgres",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "url",

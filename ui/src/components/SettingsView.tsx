@@ -7,25 +7,21 @@ import {
   LoaderCircle,
   Monitor,
   Moon,
-  RefreshCw,
   Sun,
   TestTube2,
 } from "lucide-react";
 import type {
   AppSettings,
-  McpStatus,
   OpenAiSettingsInput,
   TestResult,
   Theme,
 } from "../types";
-import { ErrorNotice, InlineResult, McpIndicator } from "./Common";
+import { ErrorNotice, InlineResult } from "./Common";
 
 interface SettingsViewProps {
   settings: AppSettings;
-  mcp: McpStatus;
   onSave: (input: OpenAiSettingsInput) => Promise<AppSettings>;
   onTest: (input: OpenAiSettingsInput) => Promise<TestResult>;
-  onRestartMcp: () => Promise<McpStatus>;
   onThemePreview: (theme: Theme) => void;
 }
 
@@ -37,10 +33,8 @@ const themeOptions: { value: Theme; label: string; icon: typeof Monitor }[] = [
 
 export function SettingsView({
   settings,
-  mcp,
   onSave,
   onTest,
-  onRestartMcp,
   onThemePreview,
 }: SettingsViewProps) {
   const [baseUrl, setBaseUrl] = useState(settings.baseUrl);
@@ -48,7 +42,7 @@ export function SettingsView({
   const [apiKey, setApiKey] = useState("");
   const [theme, setTheme] = useState<Theme>(settings.theme);
   const [showKey, setShowKey] = useState(false);
-  const [busy, setBusy] = useState<"save" | "test" | "mcp" | null>(null);
+  const [busy, setBusy] = useState<"save" | "test" | null>(null);
   const [testResult, setTestResult] = useState<TestResult | null>(null);
   const [notice, setNotice] = useState<TestResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -87,18 +81,6 @@ export function SettingsView({
     setTestResult(null);
     try {
       setTestResult(await onTest(input()));
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const restartMcp = async () => {
-    setBusy("mcp");
-    setError(null);
-    try {
-      await onRestartMcp();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -154,16 +136,6 @@ export function SettingsView({
                   </button>
                 );
               })}
-            </div>
-          </div>
-        </section>
-
-        <section className="settings-section">
-          <div className="settings-section-title"><h2>SQL Connector</h2><p>本地 MCP 进程状态。</p></div>
-          <div className="settings-form">
-            <div className="mcp-setting-row">
-              <div><McpIndicator mcp={mcp} /><span className="mcp-detail">{mcp.message || (mcp.toolsCount !== undefined ? `${mcp.toolsCount} 个工具可用` : "本地 stdio")}</span></div>
-              <button className="button button-secondary" disabled={busy !== null} onClick={() => void restartMcp()} type="button">{busy === "mcp" ? <LoaderCircle className="animate-spin" size={15} /> : <RefreshCw size={15} />} 重启 MCP</button>
             </div>
           </div>
         </section>

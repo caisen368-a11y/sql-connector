@@ -51,6 +51,7 @@ type ConnectionCacheKey = (connector_core::ConnectionId, [u8; 32]);
 const CONNECTION_CACHE_CAPACITY: u64 = 64;
 const CONNECTION_CACHE_IDLE: Duration = Duration::from_secs(120);
 const CONNECTION_POOL_SIZE: usize = 4;
+const POSTGRES_TIER1_STATUS: ConnectorStatus = ConnectorStatus::Experimental;
 
 /// `PostgreSQL` wire-protocol connector and explicitly identified compatible products.
 #[derive(Clone)]
@@ -253,7 +254,12 @@ impl Connector for PostgresConnector {
             api_mode: api_mode.into(),
             driver: "tokio-postgres".into(),
             driver_version: "0.7.15".into(),
-            status: ConnectorStatus::Experimental,
+            status: match self.flavor {
+                PostgresFlavor::PostgreSql => POSTGRES_TIER1_STATUS,
+                PostgresFlavor::CockroachDb | PostgresFlavor::YugabyteYsql => {
+                    ConnectorStatus::Experimental
+                }
+            },
             capabilities: vec![
                 Capability::TestConnection,
                 Capability::Discover,

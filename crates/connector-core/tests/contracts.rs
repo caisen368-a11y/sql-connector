@@ -102,8 +102,22 @@ fn db_values_use_tagged_lossless_json() {
         ),
     ]));
     let serialized = serde_json::to_string(&value).unwrap();
+    assert_eq!(
+        serialized,
+        format!(
+            r#"{{"type":"document","value":{{"large":{{"type":"uint64","value":{}}},"money":{{"type":"decimal","value":"1234567890.123456789"}}}}}}"#,
+            u64::MAX
+        )
+    );
     let decoded: DbValue = serde_json::from_str(&serialized).unwrap();
     assert_eq!(value, decoded);
+
+    let legacy: DbValue = serde_json::from_value(serde_json::json!({
+        "type": "u_int64",
+        "value": u64::MAX,
+    }))
+    .unwrap();
+    assert_eq!(legacy, DbValue::UInt64(u64::MAX));
 }
 
 #[test]
@@ -169,5 +183,48 @@ fn schema_inspection_route_requires_discover_and_describe() {
             .mcp_tools
             .iter()
             .all(|route| route.tool != "db_inspect_schema")
+    );
+}
+
+#[test]
+fn policy_scoped_sql_query_route_requires_sql_native_query_support() {
+    let descriptor = ConnectorManifest {
+        id: "test-postgresql".into(),
+        display_name: "Test PostgreSQL".into(),
+        product: Product::PostgreSql,
+        api_mode: "postgresql".into(),
+        driver: "test".into(),
+        driver_version: "1".into(),
+        status: ConnectorStatus::Experimental,
+        capabilities: vec![Capability::Read, Capability::NativeQuery],
+        auth_kinds: vec![AuthKind::UsernamePassword],
+        limitations: vec![],
+    }
+    .into_descriptor();
+    assert!(
+        descriptor
+            .mcp_tools
+            .iter()
+            .any(|route| route.tool == "sql_query")
+    );
+
+    let non_sql = ConnectorManifest {
+        id: "test-mongodb".into(),
+        display_name: "Test MongoDB".into(),
+        product: Product::MongoDb,
+        api_mode: "mongodb".into(),
+        driver: "test".into(),
+        driver_version: "1".into(),
+        status: ConnectorStatus::Experimental,
+        capabilities: vec![Capability::Read, Capability::NativeQuery],
+        auth_kinds: vec![AuthKind::UsernamePassword],
+        limitations: vec![],
+    }
+    .into_descriptor();
+    assert!(
+        non_sql
+            .mcp_tools
+            .iter()
+            .all(|route| route.tool != "sql_query")
     );
 }

@@ -103,6 +103,31 @@ pub struct NativeRequest {
     pub idempotency_key: Option<String>,
 }
 
+/// A policy-scoped SQL read that may use joins, aggregation, subqueries, and CTEs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SqlQueryRequest {
+    pub language: String,
+    pub statement: String,
+    #[serde(default)]
+    pub parameters: BTreeMap<String, DbValue>,
+    /// Positional parameters in protocol order. Drivers preserve native placeholder syntax.
+    #[serde(default)]
+    pub positional_parameters: Vec<DbValue>,
+}
+
+impl From<SqlQueryRequest> for NativeRequest {
+    fn from(request: SqlQueryRequest) -> Self {
+        Self {
+            language: request.language,
+            statement: request.statement,
+            parameters: request.parameters,
+            positional_parameters: request.positional_parameters,
+            max_affected: None,
+            idempotency_key: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SearchRequest {
     pub target: String,

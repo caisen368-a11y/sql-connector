@@ -338,14 +338,6 @@ button:disabled {
   font-weight: 550;
 }
 
-.sidebar-status {
-  margin-top: 8px;
-  border-top: 1px solid var(--border-subtle);
-  padding: 12px 8px 2px;
-  color: var(--text-secondary);
-  font-size: 12px;
-}
-
 .status-line {
   display: inline-flex;
   min-width: 0;
@@ -365,14 +357,6 @@ button:disabled {
 
 .status-dot-ok {
   background: var(--success);
-}
-
-.status-dot-warn {
-  background: var(--warning);
-}
-
-.status-dot-error {
-  background: var(--danger);
 }
 
 .chat-shell,
@@ -1535,28 +1519,6 @@ textarea::placeholder {
   box-shadow: 0 1px 2px rgb(0 0 0 / 7%);
 }
 
-.mcp-setting-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 20px;
-}
-
-.mcp-setting-row > div {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.mcp-detail {
-  overflow: hidden;
-  color: var(--text-tertiary);
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .toast {
   position: fixed;
   z-index: 100;
@@ -1655,7 +1617,6 @@ textarea::placeholder {
 
   .sidebar .brand,
   .sidebar .conversation-section,
-  .sidebar .sidebar-status,
   .sidebar .new-chat-button span,
   .sidebar .sidebar-nav-item span {
     display: none;

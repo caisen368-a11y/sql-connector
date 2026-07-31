@@ -52,6 +52,7 @@ const CONNECTION_CACHE_IDLE: Duration = Duration::from_secs(120);
 const CONNECTION_IDLE: Duration = Duration::from_secs(60);
 const CONNECTION_POOL_SIZE: usize = 4;
 const RSA_ENCRYPTION_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+const MYSQL_TIER1_STATUS: ConnectorStatus = ConnectorStatus::Experimental;
 
 /// `MySQL` wire-protocol connector and explicitly identified compatible products.
 #[derive(Clone)]
@@ -220,7 +221,10 @@ impl Connector for MySqlConnector {
             },
             driver: "mysql_async".into(),
             driver_version: "0.36.1".into(),
-            status: ConnectorStatus::Experimental,
+            status: match self.flavor {
+                MySqlFlavor::MySql => MYSQL_TIER1_STATUS,
+                MySqlFlavor::TiDb | MySqlFlavor::OceanBaseMySql => ConnectorStatus::Experimental,
+            },
             capabilities: vec![
                 Capability::TestConnection,
                 Capability::Discover,

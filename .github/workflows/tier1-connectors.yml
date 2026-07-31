@@ -50,6 +50,12 @@ jobs:
           cargo +1.96.1 test --locked -p connector-runtime --lib
           byte_guard_rejects_paged_results_without_mutating_the_opaque_cursor
 
+      - name: Validate policy-scoped SQL queries
+        run: >-
+          cargo +1.96.1 test --locked -p connector-runtime --test runtime
+          policy_scoped_sql_query_allows_joins_and_rejects_hidden_relations
+          -- --exact
+
       - name: Validate write unknown-outcome protection
         run: >-
           cargo +1.96.1 test --locked -p connector-runtime --test runtime
@@ -192,7 +198,6 @@ jobs:
 
           [subject_alt_name]
           DNS.1 = localhost
-          IP.1 = 127.0.0.1
           EOF
 
           cat > "$PGDATA/client.cnf" <<EOF

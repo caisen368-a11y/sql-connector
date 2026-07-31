@@ -18,8 +18,18 @@ permissions:
   contents: write
 
 jobs:
+  tier1-connectors:
+    name: Certify Tier 1 connectors
+    if: startsWith(github.ref, 'refs/tags/ui-v')
+    uses: ./.github/workflows/tier1-connectors.yml
+
   package:
     name: Package ${{ matrix.artifact }}
+    needs: tier1-connectors
+    if: >-
+      ${{ always() &&
+          (!startsWith(github.ref, 'refs/tags/ui-v') ||
+           needs.tier1-connectors.result == 'success') }}
     strategy:
       fail-fast: false
       matrix:

@@ -1,4 +1,4 @@
-use std::ops::ControlFlow;
+use std::{collections::BTreeSet, ops::ControlFlow};
 
 use connector_core::{
     ConnectionPolicy, DataEgress, DataOperation, Filter, NativeRequest, ResourceRule,
@@ -6,7 +6,9 @@ use connector_core::{
 use globset::Glob;
 use serde::{Deserialize, Serialize};
 use sqlparser::{
-    ast::{Query, SetExpr, Statement, Visit, Visitor},
+    ast::{
+        Ident, ObjectName, ObjectNamePart, Query, SetExpr, Statement, TableFactor, Visit, Visitor,
+    },
     dialect::{Dialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect},
     parser::Parser,
 };
@@ -166,6 +168,36 @@ impl PolicyEngine {
                 }
             },
         )
+    }
+
+    /// Prove a relational SQL query is read-only and authorize every base relation it reads.
+    ///
+    /// This is intentionally independent of `allow_native_read`: callers can expose a bounded,
+    /// policy-scoped SQL query tool without enabling unrestricted native queries.
+    pub fn evaluate_sql_query(
+        policy: &ConnectionPolicy,
+        request: &NativeRequest,
+    ) -> Result<Vec<String>> {
+        if !policy.enabled {
+            return Err(PolicyError::Denied("connection is disabled".into()));
+        }
+        if policy.egress == DataEgress::CloudAllowedMasked {
+            return Err(PolicyError::Denied(
+                "SQL queries cannot safely apply cloud egress field masking".into(),
+            ));
+        }
+
+        let resources = sql_query_resources(request)?;
+        for resource in &resources {
+            let allowed = Self::matching_resource_rule(policy, resource)
+                .map_or_else(|| policy.resources.is_empty(), |rule| rule.allow_read);
+            if !allowed {
+                return Err(PolicyError::Denied(format!(
+                    "read access to SQL relation `{resource}` is not permitted"
+                )));
+            }
+        }
+        Ok(resources)
     }
 
     /// Select the most specific matching rule, preserving declaration order for exact ties.
@@ -433,15 +465,19 @@ fn native_query_is_read_only(request: &NativeRequest) -> bool {
     }
     match language.as_str() {
         "sql" | "postgres" | "postgresql" | "mysql" | "mariadb" | "tsql" | "sqlserver"
-        | "oracle" | "cockroachdb" | "tidb" | "yugabytedb" | "oceanbase" | "influxql" => {
+        | "oracle" | "cockroachdb" | "tidb" | "yugabytedb" | "oceanbase" => {
+            match first_keyword(statement).as_deref() {
+                Some("select" | "with") => sql_query_resources(request).is_ok(),
+                Some("show" | "describe" | "desc" | "values") => !statement.contains(';'),
+                _ => false,
+            }
+        }
+        "influxql" => {
             !statement.contains(';')
-                && match first_keyword(statement).as_deref() {
-                    Some("select" | "show" | "describe" | "desc" | "values") => true,
-                    Some("with") if language != "influxql" => {
-                        sql_with_query_is_read_only(&language, statement)
-                    }
-                    _ => false,
-                }
+                && matches!(
+                    first_keyword(statement).as_deref(),
+                    Some("select" | "show" | "describe" | "desc")
+                )
         }
         "cql" | "cassandra" | "ycql" => {
             !statement.contains(';')
@@ -487,59 +523,317 @@ fn first_keyword(statement: &str) -> Option<String> {
     (!keyword.is_empty()).then_some(keyword)
 }
 
-fn sql_with_query_is_read_only(language: &str, statement: &str) -> bool {
-    match language {
-        "postgres" | "postgresql" | "cockroachdb" | "yugabytedb" => {
-            parsed_sql_is_read_only(&PostgreSqlDialect {}, statement)
-        }
+#[derive(Debug, Clone, Copy)]
+enum IdentifierSemantics {
+    Preserve,
+    LowercaseUnquoted,
+    UppercaseUnquoted,
+}
+
+fn sql_query_resources(request: &NativeRequest) -> Result<Vec<String>> {
+    let language = request.language.trim().to_ascii_lowercase();
+    let statement = request.statement.trim();
+    if statement.is_empty() {
+        return Err(PolicyError::InvalidOperation(
+            "SQL query must not be empty".into(),
+        ));
+    }
+
+    match language.as_str() {
+        "postgres" | "postgresql" | "cockroachdb" | "yugabytedb" => analyze_sql_with_dialect(
+            &PostgreSqlDialect {},
+            IdentifierSemantics::LowercaseUnquoted,
+            statement,
+        ),
         "mysql" | "mariadb" | "tidb" | "oceanbase" => {
-            parsed_sql_is_read_only(&MySqlDialect {}, statement)
+            analyze_sql_with_dialect(&MySqlDialect {}, IdentifierSemantics::Preserve, statement)
         }
-        "tsql" | "sqlserver" => parsed_sql_is_read_only(&MsSqlDialect {}, statement),
-        "oracle" => parsed_sql_is_read_only(&GenericDialect {}, statement),
-        "sql" => {
-            parsed_sql_is_read_only(&GenericDialect {}, statement)
-                || parsed_sql_is_read_only(&PostgreSqlDialect {}, statement)
-                || parsed_sql_is_read_only(&MySqlDialect {}, statement)
-                || parsed_sql_is_read_only(&MsSqlDialect {}, statement)
+        "tsql" | "sqlserver" => {
+            analyze_sql_with_dialect(&MsSqlDialect {}, IdentifierSemantics::Preserve, statement)
         }
-        _ => false,
+        "oracle" => analyze_sql_with_dialect(
+            &GenericDialect {},
+            IdentifierSemantics::UppercaseUnquoted,
+            statement,
+        ),
+        "sql" => analyze_generic_sql(statement),
+        _ => Err(PolicyError::InvalidOperation(format!(
+            "unsupported SQL language `{}`",
+            request.language.trim()
+        ))),
     }
 }
 
-fn parsed_sql_is_read_only(dialect: &dyn Dialect, statement: &str) -> bool {
-    struct ReadOnlyVisitor;
+fn analyze_generic_sql(statement: &str) -> Result<Vec<String>> {
+    let generic = GenericDialect {};
+    let postgres = PostgreSqlDialect {};
+    let mysql_dialect = MySqlDialect {};
+    let sql_server_dialect = MsSqlDialect {};
+    let dialects: [(&dyn Dialect, IdentifierSemantics); 4] = [
+        (&generic, IdentifierSemantics::Preserve),
+        (&postgres, IdentifierSemantics::LowercaseUnquoted),
+        (&mysql_dialect, IdentifierSemantics::Preserve),
+        (&sql_server_dialect, IdentifierSemantics::Preserve),
+    ];
 
-    impl Visitor for ReadOnlyVisitor {
-        type Break = ();
+    for (dialect, semantics) in dialects {
+        if let Some(query) = parse_single_sql_query(dialect, statement) {
+            return analyze_parsed_sql_query(query, semantics);
+        }
+    }
+    Err(PolicyError::InvalidOperation(
+        "SQL query could not be parsed as one SELECT/WITH statement".into(),
+    ))
+}
 
-        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
-            let read_only = match query.body.as_ref() {
-                SetExpr::Select(select) => select.into.is_none(),
-                SetExpr::Query(_)
-                | SetExpr::SetOperation { .. }
-                | SetExpr::Values(_)
-                | SetExpr::Table(_) => true,
-                SetExpr::Insert(_)
-                | SetExpr::Update(_)
-                | SetExpr::Delete(_)
-                | SetExpr::Merge(_) => false,
-            };
-            if read_only {
-                ControlFlow::Continue(())
-            } else {
-                ControlFlow::Break(())
+fn analyze_sql_with_dialect(
+    dialect: &dyn Dialect,
+    semantics: IdentifierSemantics,
+    statement: &str,
+) -> Result<Vec<String>> {
+    let query = parse_single_sql_query(dialect, statement).ok_or_else(|| {
+        PolicyError::InvalidOperation(
+            "SQL query could not be parsed as one SELECT/WITH statement".into(),
+        )
+    })?;
+    analyze_parsed_sql_query(query, semantics)
+}
+
+fn parse_single_sql_query(dialect: &dyn Dialect, statement: &str) -> Option<Query> {
+    let statements = Parser::parse_sql(dialect, statement).ok()?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return None;
+    };
+    Some((**query).clone())
+}
+
+fn analyze_parsed_sql_query(query: Query, semantics: IdentifierSemantics) -> Result<Vec<String>> {
+    if !set_expr_contains_select(&query.body) {
+        return Err(PolicyError::InvalidOperation(
+            "SQL query must be a SELECT or WITH ... SELECT statement".into(),
+        ));
+    }
+    let mut analyzer = SqlReadAnalyzer {
+        semantics,
+        resources: BTreeSet::new(),
+    };
+    analyzer.analyze_query(query, &BTreeSet::new())?;
+    Ok(analyzer.resources.into_iter().collect())
+}
+
+fn set_expr_contains_select(expression: &SetExpr) -> bool {
+    match expression {
+        SetExpr::Select(_) => true,
+        SetExpr::Query(query) => set_expr_contains_select(&query.body),
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_contains_select(left) || set_expr_contains_select(right)
+        }
+        SetExpr::Values(_)
+        | SetExpr::Insert(_)
+        | SetExpr::Update(_)
+        | SetExpr::Delete(_)
+        | SetExpr::Merge(_)
+        | SetExpr::Table(_) => false,
+    }
+}
+
+struct SqlReadAnalyzer {
+    semantics: IdentifierSemantics,
+    resources: BTreeSet<String>,
+}
+
+impl SqlReadAnalyzer {
+    fn analyze_query(&mut self, mut query: Query, inherited_ctes: &BTreeSet<String>) -> Result<()> {
+        validate_read_only_query_shape(&query)?;
+
+        let mut visible_ctes = inherited_ctes.clone();
+        if let Some(with) = query.with.take() {
+            for cte in with.cte_tables {
+                if cte.from.is_some() {
+                    return Err(PolicyError::InvalidOperation(
+                        "SQL CTE FROM clauses are not supported by policy analysis".into(),
+                    ));
+                }
+                let cte_name = identifier_key(&cte.alias.name, self.semantics)?;
+                if with.recursive {
+                    visible_ctes.insert(cte_name.clone());
+                }
+                self.analyze_query(*cte.query, &visible_ctes)?;
+                visible_ctes.insert(cte_name);
             }
+        }
+
+        let mut visitor = CurrentQueryVisitor {
+            semantics: self.semantics,
+            visible_ctes: &visible_ctes,
+            root_seen: false,
+            nested_depth: 0,
+            resources: BTreeSet::new(),
+            nested_queries: Vec::new(),
+        };
+        if let ControlFlow::Break(reason) = query.visit(&mut visitor) {
+            return Err(PolicyError::InvalidOperation(reason.into()));
+        }
+        self.resources.extend(visitor.resources);
+        for nested_query in visitor.nested_queries {
+            self.analyze_query(nested_query, &visible_ctes)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_read_only_query_shape(query: &Query) -> Result<()> {
+    if !query.locks.is_empty() {
+        return Err(PolicyError::InvalidOperation(
+            "SQL row-locking clauses are not read-only".into(),
+        ));
+    }
+    if !query.pipe_operators.is_empty() {
+        return Err(PolicyError::InvalidOperation(
+            "SQL pipe operators are not supported by policy analysis".into(),
+        ));
+    }
+    validate_read_only_set_expr(&query.body)
+}
+
+fn validate_read_only_set_expr(expression: &SetExpr) -> Result<()> {
+    match expression {
+        SetExpr::Select(select) => {
+            if select.into.is_some() {
+                return Err(PolicyError::InvalidOperation(
+                    "SELECT INTO is not a read-only query".into(),
+                ));
+            }
+            if !select.lateral_views.is_empty() {
+                return Err(PolicyError::InvalidOperation(
+                    "SQL lateral table functions are not supported by policy analysis".into(),
+                ));
+            }
+            Ok(())
+        }
+        SetExpr::Query(_) | SetExpr::Values(_) => Ok(()),
+        SetExpr::SetOperation { left, right, .. } => {
+            validate_read_only_set_expr(left)?;
+            validate_read_only_set_expr(right)
+        }
+        SetExpr::Insert(_)
+        | SetExpr::Update(_)
+        | SetExpr::Delete(_)
+        | SetExpr::Merge(_)
+        | SetExpr::Table(_) => Err(PolicyError::InvalidOperation(
+            "SQL query contains an unsupported or mutating query body".into(),
+        )),
+    }
+}
+
+struct CurrentQueryVisitor<'a> {
+    semantics: IdentifierSemantics,
+    visible_ctes: &'a BTreeSet<String>,
+    root_seen: bool,
+    nested_depth: usize,
+    resources: BTreeSet<String>,
+    nested_queries: Vec<Query>,
+}
+
+impl Visitor for CurrentQueryVisitor<'_> {
+    type Break = &'static str;
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        if self.root_seen {
+            if self.nested_depth == 0 {
+                self.nested_queries.push(query.clone());
+            }
+            self.nested_depth += 1;
+        } else {
+            self.root_seen = true;
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        if self.nested_depth > 0 {
+            self.nested_depth -= 1;
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<Self::Break> {
+        if self.nested_depth > 0 {
+            return ControlFlow::Continue(());
+        }
+        match table_factor {
+            TableFactor::Table {
+                args: None,
+                with_ordinality: false,
+                json_path: None,
+                ..
+            }
+            | TableFactor::Derived { .. }
+            | TableFactor::NestedJoin { .. } => ControlFlow::Continue(()),
+            _ => ControlFlow::Break(
+                "SQL table functions and unsupported table factors cannot be authorized safely",
+            ),
         }
     }
 
-    let Ok(statements) = Parser::parse_sql(dialect, statement) else {
-        return false;
-    };
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return false;
-    };
-    matches!(query.visit(&mut ReadOnlyVisitor), ControlFlow::Continue(()))
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
+        if self.nested_depth > 0 {
+            return ControlFlow::Continue(());
+        }
+        let Some(identifiers) = relation_identifiers(relation) else {
+            return ControlFlow::Break("SQL relation name cannot be authorized safely");
+        };
+        if identifiers.len() == 1 {
+            let Ok(key) = identifier_key(identifiers[0], self.semantics) else {
+                return ControlFlow::Break("SQL relation name cannot be authorized safely");
+            };
+            if self.visible_ctes.contains(&key) {
+                return ControlFlow::Continue(());
+            }
+        }
+        let Ok(resource) = relation_resource(&identifiers, self.semantics) else {
+            return ControlFlow::Break("SQL relation name cannot be authorized safely");
+        };
+        self.resources.insert(resource);
+        ControlFlow::Continue(())
+    }
+}
+
+fn relation_identifiers(relation: &ObjectName) -> Option<Vec<&Ident>> {
+    let identifiers: Option<Vec<_>> = relation.0.iter().map(ObjectNamePart::as_ident).collect();
+    identifiers.filter(|identifiers| !identifiers.is_empty())
+}
+
+fn identifier_key(identifier: &Ident, semantics: IdentifierSemantics) -> Result<String> {
+    normalized_identifier(identifier, semantics)
+}
+
+fn relation_resource(identifiers: &[&Ident], semantics: IdentifierSemantics) -> Result<String> {
+    identifiers
+        .iter()
+        .map(|identifier| normalized_identifier(identifier, semantics))
+        .collect::<Result<Vec<_>>>()
+        .map(|parts| parts.join("."))
+}
+
+fn normalized_identifier(identifier: &Ident, semantics: IdentifierSemantics) -> Result<String> {
+    if identifier.value.is_empty()
+        || identifier
+            .value
+            .contains(['.', '*', '?', '[', ']', '{', '}', '\\'])
+    {
+        return Err(PolicyError::InvalidOperation(
+            "SQL identifier cannot be mapped safely to a resource rule".into(),
+        ));
+    }
+    if identifier.quote_style.is_some() {
+        return Ok(identifier.value.clone());
+    }
+    Ok(match semantics {
+        IdentifierSemantics::Preserve => identifier.value.clone(),
+        IdentifierSemantics::LowercaseUnquoted => identifier.value.to_ascii_lowercase(),
+        IdentifierSemantics::UppercaseUnquoted => identifier.value.to_ascii_uppercase(),
+    })
 }
 
 fn mongo_command_is_read_only(statement: &str) -> bool {

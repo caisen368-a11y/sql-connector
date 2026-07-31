@@ -171,7 +171,11 @@ UI 才会启用只读原生查询并把外发模式改为 `cloud_allowed`；该�
 2. 根据该 connector manifest 的 `mcpTools` 过滤 `tools/list`，排除 host-only 工具，
    并从发给模型的 schema 删除 `connection_id`、`request_id`，以及 `native_query` 中仅供
    写操作使用的 `max_affected` 和 `idempotency_key`。
-3. 每个会话按需启动本地 stdio 进程：
+3. 未知目标优先调用 `db_inspect_schema`，一次取得一页实体及其字段说明；默认 10 个、
+   最多 20 个，并用 `next_cursor` 继续分页。SQL 连接的目录 `pattern` 同时匹配表、视图
+   和字段名，因此查找 `name`、`username` 等字段不需要执行原生
+   `information_schema` SQL。已知目标继续使用对应的结构化读取工具。
+4. 每个会话按需启动本地 stdio 进程：
 
    ```text
    sql-connector \
@@ -182,11 +186,12 @@ UI 才会启用只读原生查询并把外发模式改为 `cloud_allowed`；该�
      --session-id <conversationId>
    ```
 
-4. 模型返回 function call 后，host 强制注入真实 `connection_id` 和新的 UUIDv7
-   `request_id`，再执行 MCP `tools/call`。模型提供同名字段也会被覆盖。
-5. connector 在本地解析 profile、解密凭据、执行策略、访问数据库并应用行数、字节数、
+5. 模型返回 function call 后，host 先确认工具属于本轮实际公开的白名单，再强制注入真实
+   `connection_id` 和新的 UUIDv7 `request_id`，再执行 MCP `tools/call`。模型提供同名字段
+   也会被覆盖。
+6. connector 在本地解析 profile、解密凭据、执行策略、访问数据库并应用行数、字节数、
    超时和脱敏限制。工具参数、状态、结果或错误记录在 `ui.sqlite` 并显示为本地工具卡。
-6. host 最后按 egress policy 决定实际 tool response 是否可作为
+7. host 最后按 egress policy 决定实际 tool response 是否可作为
    `function_call_output` 返回模型。
 
 允许外发时还有独立的 **256 KiB** 模型输入上限。host 对整个 JSON tool response

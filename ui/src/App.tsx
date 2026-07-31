@@ -15,7 +15,6 @@ import type {
   ConnectionDraft,
   ConnectionPolicy,
   Conversation,
-  McpStatus,
   OpenAiSettingsInput,
   RunStatus,
   TestResult,
@@ -381,7 +380,6 @@ export default function App() {
         activeView={activeView}
         collapsed={sidebarCollapsed}
         conversations={bootstrap.conversations}
-        mcp={bootstrap.mcp}
         onDeleteConversation={(id) => void deleteConversation(id)}
         onNewConversation={() => void createConversation()}
         onSelectConversation={selectConversation}
@@ -394,7 +392,6 @@ export default function App() {
             approvals={approvals.filter((item) => item.conversationId === activeConversationId)}
             connections={bootstrap.connections}
             conversation={activeConversation}
-            mcp={bootstrap.mcp}
             onCancel={cancelRun}
             onConnectionChange={updateConversationConnection}
             onEnableDatabaseAccess={enableDatabaseAccess}
@@ -432,12 +429,6 @@ export default function App() {
         )}
         {activeView === "settings" && (
           <SettingsView
-            mcp={bootstrap.mcp}
-            onRestartMcp={async (): Promise<McpStatus> => {
-              const mcp = await desktopApi.restartMcp();
-              setBootstrap((state) => state ? { ...state, mcp } : state);
-              return mcp;
-            }}
             onSave={saveSettings}
             onTest={(input: OpenAiSettingsInput): Promise<TestResult> => desktopApi.testOpenAiSettings(input)}
             onThemePreview={previewTheme}

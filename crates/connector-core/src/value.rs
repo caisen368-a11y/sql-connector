@@ -12,6 +12,7 @@ pub enum DbValue {
     Null,
     Bool(bool),
     Int64(i64),
+    #[serde(rename = "uint64", alias = "u_int64")]
     UInt64(u64),
     Float64(f64),
     Decimal(String),

@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    future::Future,
+    sync::{Arc, Mutex, Weak},
     time::Instant,
 };
 
@@ -8,9 +9,9 @@ use chrono::Utc;
 use connector_core::{
     Capability, CatalogEntity, CatalogPage, CatalogQuery, ConnectionCapabilities, ConnectionId,
     ConnectionInfo, ConnectorContext, ConnectorDescriptor, ConnectorError, ConnectorManifest,
-    DataEgress, DataOperation, DbValue, EntityDescription, ErrorCategory, ErrorPhase,
-    OperationResult, SanitizedConnection, TIME_SERIES_QUERY_POLICY_TARGET,
-    validate_expected_version,
+    DataEgress, DataOperation, DbValue, EffectiveMcpTool, EntityDescription, ErrorCategory,
+    ErrorPhase, McpToolRoute, OperationResult, SanitizedConnection,
+    TIME_SERIES_QUERY_POLICY_TARGET, validate_expected_version,
 };
 use connector_policy::{
     Action, AuthorizationGrant, GrantVerifier, PolicyDecision, PolicyEngine, PolicyError,
@@ -22,15 +23,19 @@ use connector_store::{
 };
 use serde_json::Value;
 use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
     time::{Duration, timeout},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::{ConnectorRegistry, Result, RuntimeError};
 
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(1);
+pub const DEFAULT_GLOBAL_REQUEST_CONCURRENCY: usize = 32;
+const DEFAULT_PER_CONNECTION_REQUEST_CONCURRENCY: usize = 4;
 const MASKED_CURSOR_TTL: Duration = Duration::from_secs(15 * 60);
 const MASKED_CURSOR_CAPACITY: usize = 1024;
 const DESCRIPTION_MAX_ROWS_WARNING: &str =
@@ -47,25 +52,77 @@ pub struct ExecutionAuthorization {
     pub grant: Option<AuthorizationGrant>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestConcurrencyLimits {
+    global: usize,
+    per_connection: usize,
+}
+
+impl RequestConcurrencyLimits {
+    pub const fn new(global: usize, per_connection: usize) -> Self {
+        assert!(global > 0, "global request concurrency must be positive");
+        assert!(
+            global <= DEFAULT_GLOBAL_REQUEST_CONCURRENCY,
+            "global request concurrency must not exceed worker capacity"
+        );
+        assert!(
+            per_connection > 0 && per_connection <= global,
+            "per-connection request concurrency must be positive and not exceed global capacity"
+        );
+        Self {
+            global,
+            per_connection,
+        }
+    }
+}
+
+impl Default for RequestConcurrencyLimits {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_GLOBAL_REQUEST_CONCURRENCY,
+            DEFAULT_PER_CONNECTION_REQUEST_CONCURRENCY,
+        )
+    }
+}
+
 pub struct Runtime {
     profiles: Arc<ProfileRepository>,
     credentials: Arc<dyn CredentialStore>,
     audit: Arc<AuditRepository>,
     registry: Arc<ConnectorRegistry>,
     grant_verifier: Option<Arc<GrantVerifier>>,
-    active_requests: Mutex<HashMap<String, ActiveRequest>>,
+    request_concurrency_limits: RequestConcurrencyLimits,
+    global_request_capacity: Arc<Semaphore>,
+    connection_request_capacity: Mutex<HashMap<ConnectionId, Weak<Semaphore>>>,
+    requests: Mutex<HashMap<String, Arc<RequestControl>>>,
     masked_cursors: Mutex<MaskedCursorRegistry>,
 }
 
-struct ActiveRequest {
-    connection_id: ConnectionId,
-    session_id: String,
-    connector: Arc<dyn connector_core::Connector>,
+struct RequestGuard<'a> {
+    requests: &'a Mutex<HashMap<String, Arc<RequestControl>>>,
+    request_id: String,
+    control: Arc<RequestControl>,
+    _global_permit: OwnedSemaphorePermit,
+    _connection_permit: OwnedSemaphorePermit,
 }
 
-struct ActiveRequestGuard<'a> {
-    requests: &'a Mutex<HashMap<String, ActiveRequest>>,
-    request_id: String,
+struct RequestControl {
+    connection_id: ConnectionId,
+    session_id: String,
+    cancellation: CancellationToken,
+    state: Mutex<RequestState>,
+}
+
+enum RequestState {
+    Pending,
+    Active(Arc<dyn connector_core::Connector>),
+    CancelRequested(Option<Arc<dyn connector_core::Connector>>),
+}
+
+enum ConnectorRun<T> {
+    Completed(T),
+    TimedOut,
+    Cancelled { dispatched: bool },
 }
 
 #[derive(Default)]
@@ -82,11 +139,11 @@ struct MaskedCursor {
     expires_at: Instant,
 }
 
-impl Drop for ActiveRequestGuard<'_> {
+impl Drop for RequestGuard<'_> {
     fn drop(&mut self) {
         self.requests
             .lock()
-            .expect("active request map poisoned")
+            .expect("request map poisoned")
             .remove(&self.request_id);
     }
 }
@@ -171,9 +228,20 @@ impl Runtime {
             audit,
             registry,
             grant_verifier,
-            active_requests: Mutex::new(HashMap::new()),
+            request_concurrency_limits: RequestConcurrencyLimits::default(),
+            global_request_capacity: Arc::new(Semaphore::new(DEFAULT_GLOBAL_REQUEST_CONCURRENCY)),
+            connection_request_capacity: Mutex::new(HashMap::new()),
+            requests: Mutex::new(HashMap::new()),
             masked_cursors: Mutex::new(MaskedCursorRegistry::default()),
         }
+    }
+
+    #[must_use]
+    pub fn with_request_concurrency_limits(mut self, limits: RequestConcurrencyLimits) -> Self {
+        self.request_concurrency_limits = limits;
+        self.global_request_capacity = Arc::new(Semaphore::new(limits.global));
+        self.connection_request_capacity = Mutex::new(HashMap::new());
+        self
     }
 
     pub fn list_connections(&self) -> Result<Vec<SanitizedConnection>> {
@@ -203,11 +271,17 @@ impl Runtime {
             .resolve(profile.product, &profile.api_mode)?
             .manifest()
             .into_descriptor();
+        let effective_mcp_tools = connector
+            .mcp_tools
+            .iter()
+            .map(|route| effective_mcp_tool(&profile.policy, route))
+            .collect();
         Ok(ConnectionCapabilities {
             connector,
             connection: SanitizedConnection::from(&profile),
             policy: profile.policy.clone(),
             policy_version: profile.policy_version,
+            effective_mcp_tools,
         })
     }
 
@@ -221,6 +295,7 @@ impl Runtime {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn test_connection_with_request_id(
         &self,
         connection_id: ConnectionId,
@@ -228,10 +303,12 @@ impl Runtime {
         session_id: &str,
         request_id: Option<String>,
     ) -> Result<ConnectionInfo> {
-        validate_optional_request_id(request_id.as_deref())?;
+        let (request_id, request) =
+            self.reserve_optional_request(request_id, connection_id, session_id)?;
         let profile = self.load_profile(connection_id).await?;
         let connector = self.registry.resolve(profile.product, &profile.api_mode)?;
-        let context = connector_context_with_request_id(session_id, &profile.policy, request_id);
+        let context =
+            connector_context_with_request_id(session_id, &profile.policy, Some(request_id));
         let started = Instant::now();
         if !profile.policy.enabled {
             self.record_audit(
@@ -274,34 +351,50 @@ impl Runtime {
             return Err(error);
         }
         let secret = self.credentials.get(&profile.secret_ref)?;
-        let _active_request = self.register_active_request(
-            &context.request_id,
-            connection_id,
-            session_id,
-            Arc::clone(&connector),
-        )?;
-        let timed_result = timeout(
+        Self::activate_request(&request, Arc::clone(&connector))?;
+        let connector_run = run_connector_future(
+            &request.control.cancellation,
             Duration::from_millis(profile.policy.timeout_ms),
             connector.test_connection(&context, &profile, &secret),
         )
         .await;
-        let Ok(result) = timed_result else {
-            cancel_best_effort(connector.as_ref(), &context.request_id).await;
-            self.record_audit(
-                &context.request_id,
-                subject,
-                session_id,
-                Some(connection_id),
-                "db_test_connection",
-                None,
-                "allow",
-                false,
-                started,
-                0,
-                0,
-                Some(ErrorCategory::Timeout),
-            );
-            return Err(RuntimeError::Timeout);
+        let result = match connector_run {
+            ConnectorRun::Completed(result) => result,
+            ConnectorRun::TimedOut => {
+                cancel_best_effort(connector.as_ref(), &context.request_id).await;
+                self.record_audit(
+                    &context.request_id,
+                    subject,
+                    session_id,
+                    Some(connection_id),
+                    "db_test_connection",
+                    None,
+                    "allow",
+                    false,
+                    started,
+                    0,
+                    0,
+                    Some(ErrorCategory::Timeout),
+                );
+                return Err(RuntimeError::Timeout);
+            }
+            ConnectorRun::Cancelled { .. } => {
+                self.record_audit(
+                    &context.request_id,
+                    subject,
+                    session_id,
+                    Some(connection_id),
+                    "db_test_connection",
+                    None,
+                    "allow",
+                    false,
+                    started,
+                    0,
+                    0,
+                    Some(ErrorCategory::Cancelled),
+                );
+                return Err(request_cancelled_error(false));
+            }
         };
         let result = result.and_then(|info| {
             validate_expected_version(&profile, &info)?;
@@ -335,6 +428,7 @@ impl Runtime {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn search_catalog_with_request_id(
         &self,
         connection_id: ConnectionId,
@@ -343,10 +437,12 @@ impl Runtime {
         mut query: CatalogQuery,
         request_id: Option<String>,
     ) -> Result<CatalogPage> {
-        validate_optional_request_id(request_id.as_deref())?;
+        let (request_id, request) =
+            self.reserve_optional_request(request_id, connection_id, session_id)?;
         let profile = self.load_profile(connection_id).await?;
         let connector = self.registry.resolve(profile.product, &profile.api_mode)?;
-        let context = connector_context_with_request_id(session_id, &profile.policy, request_id);
+        let context =
+            connector_context_with_request_id(session_id, &profile.policy, Some(request_id));
         let started = Instant::now();
         if !profile.policy.enabled {
             self.record_audit(
@@ -393,12 +489,7 @@ impl Runtime {
             .min(context.max_rows)
             .min(profile.policy.max_rows);
         let secret = self.credentials.get(&profile.secret_ref)?;
-        let _active_request = self.register_active_request(
-            &context.request_id,
-            connection_id,
-            session_id,
-            Arc::clone(&connector),
-        )?;
+        Self::activate_request(&request, Arc::clone(&connector))?;
         let requested_limit = query.limit;
         let catalog = async {
             if requested_limit == 0 {
@@ -439,24 +530,49 @@ impl Runtime {
                 page_query.cursor = page.next_cursor;
             }
         };
-        let timed_result = timeout(Duration::from_millis(profile.policy.timeout_ms), catalog).await;
-        let Ok(result) = timed_result else {
-            cancel_best_effort(connector.as_ref(), &context.request_id).await;
-            self.record_audit(
-                &context.request_id,
-                subject,
-                session_id,
-                Some(connection_id),
-                "db_search_catalog",
-                None,
-                "allow",
-                false,
-                started,
-                0,
-                0,
-                Some(ErrorCategory::Timeout),
-            );
-            return Err(RuntimeError::Timeout);
+        let connector_run = run_connector_future(
+            &request.control.cancellation,
+            Duration::from_millis(profile.policy.timeout_ms),
+            catalog,
+        )
+        .await;
+        let result = match connector_run {
+            ConnectorRun::Completed(result) => result,
+            ConnectorRun::TimedOut => {
+                cancel_best_effort(connector.as_ref(), &context.request_id).await;
+                self.record_audit(
+                    &context.request_id,
+                    subject,
+                    session_id,
+                    Some(connection_id),
+                    "db_search_catalog",
+                    None,
+                    "allow",
+                    false,
+                    started,
+                    0,
+                    0,
+                    Some(ErrorCategory::Timeout),
+                );
+                return Err(RuntimeError::Timeout);
+            }
+            ConnectorRun::Cancelled { .. } => {
+                self.record_audit(
+                    &context.request_id,
+                    subject,
+                    session_id,
+                    Some(connection_id),
+                    "db_search_catalog",
+                    None,
+                    "allow",
+                    false,
+                    started,
+                    0,
+                    0,
+                    Some(ErrorCategory::Cancelled),
+                );
+                return Err(request_cancelled_error(false));
+            }
         };
         let returned = result.as_ref().map_or(0, |page| page.entities.len() as u64);
         self.record_audit(
@@ -487,6 +603,7 @@ impl Runtime {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn describe_entity_with_request_id(
         &self,
         connection_id: ConnectionId,
@@ -495,10 +612,12 @@ impl Runtime {
         entity_id: &str,
         request_id: Option<String>,
     ) -> Result<EntityDescription> {
-        validate_optional_request_id(request_id.as_deref())?;
+        let (request_id, request) =
+            self.reserve_optional_request(request_id, connection_id, session_id)?;
         let profile = self.load_profile(connection_id).await?;
         let connector = self.registry.resolve(profile.product, &profile.api_mode)?;
-        let context = connector_context_with_request_id(session_id, &profile.policy, request_id);
+        let context =
+            connector_context_with_request_id(session_id, &profile.policy, Some(request_id));
         let started = Instant::now();
         if let Err(error) = validate_capability_tool(
             &connector.manifest().into_descriptor(),
@@ -542,34 +661,50 @@ impl Runtime {
             .into());
         }
         let secret = self.credentials.get(&profile.secret_ref)?;
-        let _active_request = self.register_active_request(
-            &context.request_id,
-            connection_id,
-            session_id,
-            Arc::clone(&connector),
-        )?;
-        let timed_result = timeout(
+        Self::activate_request(&request, Arc::clone(&connector))?;
+        let connector_run = run_connector_future(
+            &request.control.cancellation,
             Duration::from_millis(profile.policy.timeout_ms),
             connector.describe_entity(&context, &profile, &secret, entity_id),
         )
         .await;
-        let Ok(result) = timed_result else {
-            cancel_best_effort(connector.as_ref(), &context.request_id).await;
-            self.record_audit(
-                &context.request_id,
-                subject,
-                session_id,
-                Some(connection_id),
-                "db_describe_entity",
-                Some(entity_id),
-                "allow",
-                false,
-                started,
-                0,
-                0,
-                Some(ErrorCategory::Timeout),
-            );
-            return Err(RuntimeError::Timeout);
+        let result = match connector_run {
+            ConnectorRun::Completed(result) => result,
+            ConnectorRun::TimedOut => {
+                cancel_best_effort(connector.as_ref(), &context.request_id).await;
+                self.record_audit(
+                    &context.request_id,
+                    subject,
+                    session_id,
+                    Some(connection_id),
+                    "db_describe_entity",
+                    Some(entity_id),
+                    "allow",
+                    false,
+                    started,
+                    0,
+                    0,
+                    Some(ErrorCategory::Timeout),
+                );
+                return Err(RuntimeError::Timeout);
+            }
+            ConnectorRun::Cancelled { .. } => {
+                self.record_audit(
+                    &context.request_id,
+                    subject,
+                    session_id,
+                    Some(connection_id),
+                    "db_describe_entity",
+                    Some(entity_id),
+                    "allow",
+                    false,
+                    started,
+                    0,
+                    0,
+                    Some(ErrorCategory::Cancelled),
+                );
+                return Err(request_cancelled_error(false));
+            }
         };
         let result = result.and_then(|mut description| {
             filter_invisible_relationships(&profile.policy, &mut description);
@@ -616,6 +751,8 @@ impl Runtime {
         let audit_request_id = request_id
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let request =
+            self.reserve_request(&audit_request_id, connection_id, &authorization.session_id)?;
         let profile = self.load_profile(connection_id).await?;
         let connector = self.registry.resolve(profile.product, &profile.api_mode)?;
         let descriptor = connector.manifest().into_descriptor();
@@ -757,12 +894,24 @@ impl Runtime {
             &profile.policy,
             Some(audit_request_id),
         );
-        let _active_request = self.register_active_request(
-            &context.request_id,
-            connection_id,
-            &authorization.session_id,
-            Arc::clone(&connector),
-        )?;
+        Self::activate_request(&request, Arc::clone(&connector))?;
+        if request.control.cancellation.is_cancelled() {
+            self.record_audit(
+                &context.request_id,
+                &authorization.subject,
+                &authorization.session_id,
+                Some(connection_id),
+                &authorization.tool,
+                target.as_deref(),
+                decision_name(decision),
+                confirmed,
+                started,
+                0,
+                0,
+                Some(ErrorCategory::Cancelled),
+            );
+            return Err(request_cancelled_error(false));
+        }
         if let Some(verified_grant) = &verified_grant {
             let replay_error = match self.audit.consume_grant_nonce(
                 verified_grant.replay_key(),
@@ -849,52 +998,91 @@ impl Runtime {
                 return Err(RuntimeError::Connector(error));
             }
         }
-        let connector_result = timeout(
+        let mut connector_profile = profile.clone();
+        if authorization.tool == "sql_query" {
+            // The runtime has already parsed the query and authorized every base relation.
+            // SQL adapters still require this flag before entering their read-only transaction.
+            connector_profile.policy.allow_native_read = true;
+        }
+        let connector_run = run_connector_future(
+            &request.control.cancellation,
             Duration::from_millis(profile.policy.timeout_ms),
-            connector.execute(&context, &profile, &secret, operation),
+            connector.execute(&context, &connector_profile, &secret, operation),
         )
         .await;
 
-        let Ok(result) = connector_result else {
-            cancel_best_effort(connector.as_ref(), &context.request_id).await;
-            let write_outcome_unknown = matches!(
-                action,
-                Action::Insert | Action::Update | Action::Delete | Action::NativeWrite
-            );
-            if write_outcome_unknown {
+        let write = matches!(
+            action,
+            Action::Insert | Action::Update | Action::Delete | Action::NativeWrite
+        );
+        let result = match connector_run {
+            ConnectorRun::Completed(result) => result,
+            ConnectorRun::TimedOut => {
+                cancel_best_effort(connector.as_ref(), &context.request_id).await;
+                if write {
+                    self.finish_idempotency(
+                        connection_id,
+                        idempotency.as_ref(),
+                        IdempotencyFinish::Unknown,
+                        &context.request_id,
+                    );
+                }
+                let error_category = if write {
+                    ErrorCategory::UnknownOutcome
+                } else {
+                    ErrorCategory::Timeout
+                };
+                self.record_audit(
+                    &context.request_id,
+                    &authorization.subject,
+                    &authorization.session_id,
+                    Some(connection_id),
+                    &authorization.tool,
+                    target.as_deref(),
+                    decision_name(decision),
+                    confirmed,
+                    started,
+                    0,
+                    0,
+                    Some(error_category),
+                );
+                if write {
+                    return Err(RuntimeError::Connector(ConnectorError::new(
+                        ErrorCategory::UnknownOutcome,
+                        "operation timed out after it was sent; the database write outcome is unknown",
+                    )));
+                }
+                return Err(RuntimeError::Timeout);
+            }
+            ConnectorRun::Cancelled { dispatched } => {
+                let write_outcome_unknown = write && dispatched;
                 self.finish_idempotency(
                     connection_id,
                     idempotency.as_ref(),
-                    IdempotencyFinish::Unknown,
+                    if write_outcome_unknown {
+                        IdempotencyFinish::Unknown
+                    } else {
+                        IdempotencyFinish::Release
+                    },
                     &context.request_id,
                 );
+                let error = request_cancelled_error(write_outcome_unknown);
+                self.record_audit(
+                    &context.request_id,
+                    &authorization.subject,
+                    &authorization.session_id,
+                    Some(connection_id),
+                    &authorization.tool,
+                    target.as_deref(),
+                    decision_name(decision),
+                    confirmed,
+                    started,
+                    0,
+                    0,
+                    Some(runtime_error_category(&error)),
+                );
+                return Err(error);
             }
-            let error_category = if write_outcome_unknown {
-                ErrorCategory::UnknownOutcome
-            } else {
-                ErrorCategory::Timeout
-            };
-            self.record_audit(
-                &context.request_id,
-                &authorization.subject,
-                &authorization.session_id,
-                Some(connection_id),
-                &authorization.tool,
-                target.as_deref(),
-                decision_name(decision),
-                confirmed,
-                started,
-                0,
-                0,
-                Some(error_category),
-            );
-            if write_outcome_unknown {
-                return Err(RuntimeError::Connector(ConnectorError::new(
-                    ErrorCategory::UnknownOutcome,
-                    "operation timed out after it was sent; the database write outcome is unknown",
-                )));
-            }
-            return Err(RuntimeError::Timeout);
         };
 
         let connector_succeeded = result.is_ok();
@@ -1002,39 +1190,45 @@ impl Runtime {
                     .into(),
             ));
         }
-        let connector = self
-            .active_requests
+        let control = self
+            .requests
             .lock()
-            .expect("active request map poisoned")
+            .expect("request map poisoned")
             .get(request_id)
             .filter(|request| {
                 request.connection_id == connection_id && request.session_id == session_id
             })
-            .map(|request| Arc::clone(&request.connector));
-        let Some(connector) = connector else {
+            .cloned();
+        let Some(control) = control else {
             return Err(RuntimeError::InvalidRequest(
                 "request is not active in the current MCP session".into(),
             ));
         };
-        cancel_with_timeout(connector.as_ref(), request_id).await
+        let connector = request_cancel(&control);
+        if let Some(connector) = connector {
+            cancel_with_timeout(connector.as_ref(), request_id).await?;
+        }
+        Ok(())
     }
 
     /// Cancel active work and drop cached clients for one stored connection.
     pub async fn invalidate_connection(&self, connection_id: ConnectionId) {
         self.clear_masked_cursors(connection_id);
-        let active = self
-            .active_requests
+        let requests = self
+            .requests
             .lock()
-            .expect("active request map poisoned")
+            .expect("request map poisoned")
             .iter()
             .filter(|(_, request)| request.connection_id == connection_id)
-            .map(|(request_id, request)| (request_id.clone(), Arc::clone(&request.connector)))
+            .map(|(request_id, request)| (request_id.clone(), Arc::clone(request)))
             .collect::<Vec<_>>();
         let mut cancellations = JoinSet::new();
-        for (request_id, connector) in active {
-            cancellations.spawn(async move {
-                cancel_best_effort(connector.as_ref(), &request_id).await;
-            });
+        for (request_id, control) in requests {
+            if let Some(connector) = request_cancel(&control) {
+                cancellations.spawn(async move {
+                    cancel_best_effort(connector.as_ref(), &request_id).await;
+                });
+            }
         }
         while let Some(result) = cancellations.join_next().await {
             if let Err(error) = result {
@@ -1123,34 +1317,104 @@ impl Runtime {
         }
     }
 
-    fn register_active_request(
+    fn activate_request(
+        request: &RequestGuard<'_>,
+        connector: Arc<dyn connector_core::Connector>,
+    ) -> Result<()> {
+        let mut state = request
+            .control
+            .state
+            .lock()
+            .expect("request state poisoned");
+        match &*state {
+            RequestState::Pending => {
+                *state = RequestState::Active(connector);
+                Ok(())
+            }
+            RequestState::CancelRequested(_) => Err(request_cancelled_error(false)),
+            RequestState::Active(_) => Err(RuntimeError::InvalidRequest(
+                "request_id is already active".into(),
+            )),
+        }
+    }
+
+    fn reserve_request(
         &self,
         request_id: &str,
         connection_id: ConnectionId,
         session_id: &str,
-        connector: Arc<dyn connector_core::Connector>,
-    ) -> Result<ActiveRequestGuard<'_>> {
-        let mut requests = self
-            .active_requests
-            .lock()
-            .expect("active request map poisoned");
-        if requests.contains_key(request_id) {
-            return Err(RuntimeError::InvalidRequest(
-                "request_id is already active".into(),
-            ));
+    ) -> Result<RequestGuard<'_>> {
+        let control = Arc::new(RequestControl {
+            connection_id,
+            session_id: session_id.to_owned(),
+            cancellation: CancellationToken::new(),
+            state: Mutex::new(RequestState::Pending),
+        });
+        {
+            let mut requests = self.requests.lock().expect("request map poisoned");
+            if requests.contains_key(request_id) {
+                return Err(RuntimeError::InvalidRequest(
+                    "request_id is already active".into(),
+                ));
+            }
+            requests.insert(request_id.to_owned(), Arc::clone(&control));
         }
-        requests.insert(
-            request_id.to_owned(),
-            ActiveRequest {
-                connection_id,
-                session_id: session_id.to_owned(),
-                connector,
-            },
-        );
-        Ok(ActiveRequestGuard {
-            requests: &self.active_requests,
+
+        let Ok(global_permit) = Arc::clone(&self.global_request_capacity).try_acquire_owned()
+        else {
+            self.release_request(request_id);
+            return Err(request_capacity_error(
+                "runtime request capacity is exhausted; retry later",
+            ));
+        };
+        let connection_capacity = {
+            let mut capacities = self
+                .connection_request_capacity
+                .lock()
+                .expect("connection request capacity map poisoned");
+            capacities.retain(|_, capacity| capacity.strong_count() > 0);
+            if let Some(capacity) = capacities.get(&connection_id).and_then(Weak::upgrade) {
+                capacity
+            } else {
+                let capacity = Arc::new(Semaphore::new(
+                    self.request_concurrency_limits.per_connection,
+                ));
+                capacities.insert(connection_id, Arc::downgrade(&capacity));
+                capacity
+            }
+        };
+        let Ok(connection_permit) = connection_capacity.try_acquire_owned() else {
+            self.release_request(request_id);
+            return Err(request_capacity_error(
+                "connection request capacity is exhausted; retry later",
+            ));
+        };
+        Ok(RequestGuard {
+            requests: &self.requests,
             request_id: request_id.to_owned(),
+            control,
+            _global_permit: global_permit,
+            _connection_permit: connection_permit,
         })
+    }
+
+    fn reserve_optional_request(
+        &self,
+        request_id: Option<String>,
+        connection_id: ConnectionId,
+        session_id: &str,
+    ) -> Result<(String, RequestGuard<'_>)> {
+        validate_optional_request_id(request_id.as_deref())?;
+        let request_id = request_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let request = self.reserve_request(&request_id, connection_id, session_id)?;
+        Ok((request_id, request))
+    }
+
+    fn release_request(&self, request_id: &str) {
+        self.requests
+            .lock()
+            .expect("request map poisoned")
+            .remove(request_id);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1204,6 +1468,14 @@ fn valid_request_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
+fn request_capacity_error(message: &str) -> RuntimeError {
+    RuntimeError::Connector(
+        ConnectorError::new(ErrorCategory::RateLimited, message)
+            .retryable(true)
+            .with_code("busy"),
+    )
+}
+
 fn validate_optional_request_id(request_id: Option<&str>) -> Result<()> {
     if request_id.is_some_and(|value| !valid_request_id(value)) {
         return Err(RuntimeError::InvalidRequest(
@@ -1218,6 +1490,12 @@ fn evaluate_mcp_policy(
     operation: &DataOperation,
     tool: &str,
 ) -> connector_policy::Result<PolicyDecision> {
+    if tool == "sql_query"
+        && let DataOperation::NativeQuery(request) = operation
+    {
+        PolicyEngine::evaluate_sql_query(policy, request)?;
+        return Ok(PolicyDecision::Allow);
+    }
     if tool == "timeseries_query" && matches!(operation, DataOperation::NativeQuery(_)) {
         if !policy.allow_time_series_query {
             return Ok(PolicyDecision::Deny);
@@ -1255,6 +1533,13 @@ fn policy_denial_reason(
         return "the connection is disabled by its policy";
     }
     if action == Action::NativeRead {
+        if tool == "sql_query" {
+            return if policy.egress == DataEgress::CloudAllowedMasked {
+                "policy-scoped SQL queries are unavailable with `cloud_allowed_masked`"
+            } else {
+                "one or more SQL relations are denied by the connection read policy"
+            };
+        }
         if tool == "timeseries_query" {
             return if policy.allow_time_series_query {
                 "the time-series query is denied by the connection resource or egress policy"
@@ -1275,6 +1560,92 @@ fn policy_denial_reason(
     "operation is not permitted by the connection policy"
 }
 
+fn effective_mcp_tool(
+    policy: &connector_core::ConnectionPolicy,
+    route: &McpToolRoute,
+) -> EffectiveMcpTool {
+    let unavailable_reason = if policy.enabled {
+        effective_tool_unavailable_reason(policy, route)
+    } else {
+        Some("the connection is disabled")
+    };
+    EffectiveMcpTool {
+        capability: route.capability,
+        tool: route.tool.clone(),
+        available: unavailable_reason.is_none(),
+        unavailable_reason: unavailable_reason.map(str::to_owned),
+    }
+}
+
+fn effective_tool_unavailable_reason(
+    policy: &connector_core::ConnectionPolicy,
+    route: &McpToolRoute,
+) -> Option<&'static str> {
+    match route.tool.as_str() {
+        "native_query" if !policy.allow_native_read => {
+            Some("native read queries are disabled by the connection policy")
+        }
+        "native_query" | "sql_query" if policy.egress == DataEgress::CloudAllowedMasked => {
+            Some("this query tool cannot apply field masking safely")
+        }
+        "native_execute" if !policy.allow_native_write => {
+            Some("native write commands are disabled by the connection policy")
+        }
+        "timeseries_query" if !policy.allow_time_series_query => {
+            Some("time-series queries are disabled by the connection policy")
+        }
+        "sql_query"
+        | "sql_read"
+        | "document_find"
+        | "kv_read"
+        | "search_query"
+        | "search_document_read"
+        | "vector_fetch"
+        | "vector_search"
+            if !policy.resources.is_empty() && !any_resource_allows(policy, Action::Read) =>
+        {
+            Some("no connection resource allows reads")
+        }
+        "sql_insert"
+        | "document_insert"
+        | "kv_put"
+        | "search_document_upsert"
+        | "event_ingest"
+        | "vector_insert"
+        | "vector_upsert"
+        | "timeseries_write"
+            if !any_resource_allows(policy, Action::Insert) =>
+        {
+            Some("no connection resource allows inserts")
+        }
+        "sql_update" | "document_update" | "kv_update" | "search_document_update"
+            if !any_resource_allows(policy, Action::Update) =>
+        {
+            Some("no connection resource allows updates")
+        }
+        "sql_delete"
+        | "document_delete"
+        | "kv_delete"
+        | "search_document_delete"
+        | "vector_delete"
+            if !any_resource_allows(policy, Action::Delete) =>
+        {
+            Some("no connection resource allows deletes")
+        }
+        _ => None,
+    }
+}
+
+fn any_resource_allows(policy: &connector_core::ConnectionPolicy, action: Action) -> bool {
+    policy.resources.iter().any(|rule| match action {
+        Action::Metadata | Action::Read | Action::NativeRead => rule.allow_read,
+        Action::Insert => rule.allow_insert,
+        Action::Update => rule.allow_update,
+        Action::Delete => rule.allow_delete,
+        Action::NativeWrite => false,
+    })
+}
+
 async fn cancel_with_timeout(
     connector: &dyn connector_core::Connector,
     request_id: &str,
@@ -1283,6 +1654,61 @@ async fn cancel_with_timeout(
         .await
         .map_err(|_| RuntimeError::Timeout)??;
     Ok(())
+}
+
+fn request_cancel(control: &RequestControl) -> Option<Arc<dyn connector_core::Connector>> {
+    let mut state = control.state.lock().expect("request state poisoned");
+    let connector = match &*state {
+        RequestState::Pending => None,
+        RequestState::Active(connector) => Some(Arc::clone(connector)),
+        RequestState::CancelRequested(connector) => connector.as_ref().map(Arc::clone),
+    };
+    *state = RequestState::CancelRequested(connector.as_ref().map(Arc::clone));
+    control.cancellation.cancel();
+    connector
+}
+
+async fn run_connector_future<T, F>(
+    cancellation: &CancellationToken,
+    duration: Duration,
+    future: F,
+) -> ConnectorRun<T>
+where
+    F: Future<Output = T>,
+{
+    if cancellation.is_cancelled() {
+        return ConnectorRun::Cancelled { dispatched: false };
+    }
+
+    let dispatched = std::sync::atomic::AtomicBool::new(false);
+    let dispatch = async {
+        dispatched.store(true, std::sync::atomic::Ordering::Release);
+        future.await
+    };
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => ConnectorRun::Cancelled {
+            dispatched: dispatched.load(std::sync::atomic::Ordering::Acquire),
+        },
+        result = timeout(duration, dispatch) => match result {
+            Ok(result) => ConnectorRun::Completed(result),
+            Err(_) => ConnectorRun::TimedOut,
+        },
+    }
+}
+
+fn request_cancelled_error(dispatched_write: bool) -> RuntimeError {
+    if dispatched_write {
+        RuntimeError::Connector(ConnectorError::new(
+            ErrorCategory::UnknownOutcome,
+            "write cancellation was requested after dispatch; the database outcome is unknown",
+        ))
+    } else {
+        RuntimeError::Connector(ConnectorError::new(
+            ErrorCategory::Cancelled,
+            "request was cancelled",
+        ))
+    }
 }
 
 async fn cancel_best_effort(connector: &dyn connector_core::Connector, request_id: &str) {

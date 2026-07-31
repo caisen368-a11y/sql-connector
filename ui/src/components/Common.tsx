@@ -1,5 +1,5 @@
 import { AlertCircle, CheckCircle2, LoaderCircle, XCircle } from "lucide-react";
-import type { McpStatus, TestResult } from "../types";
+import type { TestResult } from "../types";
 
 export function formatRelativeTime(value: string): string {
   const date = new Date(value);
@@ -14,19 +14,6 @@ export function formatRelativeTime(value: string): string {
   const days = Math.round(hours / 24);
   if (Math.abs(days) < 7) return formatter.format(days, "day");
   return new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric" }).format(date);
-}
-
-export function McpIndicator({ mcp, showLabel = true }: { mcp: McpStatus; showLabel?: boolean }) {
-  const connected = mcp.status === "connected";
-  const working = mcp.status === "starting";
-  return (
-    <span className="status-line" title={mcp.message ?? undefined}>
-      <span
-        className={`status-dot ${connected ? "status-dot-ok" : working ? "status-dot-warn" : "status-dot-error"}`}
-      />
-      {showLabel && (connected ? "MCP 已连接" : working ? "MCP 启动中" : "MCP 未连接")}
-    </span>
-  );
 }
 
 export function InlineResult({ result }: { result: TestResult | null }) {

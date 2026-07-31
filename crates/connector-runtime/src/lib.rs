@@ -4,7 +4,9 @@ mod registry;
 mod runtime;
 
 pub use registry::ConnectorRegistry;
-pub use runtime::{ExecutionAuthorization, Runtime};
+pub use runtime::{
+    DEFAULT_GLOBAL_REQUEST_CONCURRENCY, ExecutionAuthorization, RequestConcurrencyLimits, Runtime,
+};
 
 use thiserror::Error;
 

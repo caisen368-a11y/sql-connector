@@ -407,20 +407,24 @@ async fn all_advertised_authentication_and_secret_boundaries_work_through_cli_an
         &secrets,
     );
 
-    for (label, path) in [
-        (
-            "encrypted credential database",
-            data_dir.join("credentials.sqlite"),
-        ),
-        (
-            "plaintext profile database",
-            data_dir.join("connections.sqlite"),
-        ),
-        ("plaintext audit database", data_dir.join("audit.sqlite")),
-        ("host and worker logs", log_file),
-    ] {
-        assert_bytes_exclude_secrets(label, &fs::read(path).unwrap(), &secrets);
+    for file_name in ["credentials.sqlite", "connections.sqlite", "audit.sqlite"] {
+        assert!(data_dir.join(file_name).is_file(), "missing {file_name}");
     }
+    for entry in fs::read_dir(&data_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            assert_bytes_exclude_secrets(
+                &format!("database file {}", path.display()),
+                &fs::read(path).unwrap(),
+                &secrets,
+            );
+        }
+    }
+    assert_bytes_exclude_secrets(
+        "host and worker logs",
+        &fs::read(log_file).unwrap(),
+        &secrets,
+    );
 }
 
 fn run_json_command(

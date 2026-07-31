@@ -117,6 +117,10 @@ Discovery tools include `db_list_connections`, `db_list_connectors`,
 with the corresponding entity descriptions to reduce model round trips. Data
 tools are grouped by model: SQL, native, document/key-value, time-series,
 search/event, and vector operations.
+`sql_query` runs one read-only SELECT/WITH query for joins, aggregation,
+subqueries, and CTEs. Unlike the high-privilege `native_query`, it checks every
+referenced base relation against the saved read policy and does not require
+global native-read access.
 For PostgreSQL-compatible, MySQL-compatible, SQL Server, and Oracle connections,
 entity descriptions expose comments plus stable relational metadata keys:
 `primary_key`, `foreign_keys`, `unique_constraints`, and `indexes`.

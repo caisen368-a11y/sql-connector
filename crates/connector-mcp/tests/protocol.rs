@@ -35,6 +35,7 @@ async fn stdio_protocol_advertises_typed_tools_without_secret_arguments() {
     assert!(names.contains(&"db_list_connectors"));
     assert!(names.contains(&"db_cancel"));
     assert!(names.contains(&"sql_read"));
+    assert!(names.contains(&"sql_query"));
     assert!(names.contains(&"vector_search"));
 
     let sql_read = listed
@@ -45,6 +46,15 @@ async fn stdio_protocol_advertises_typed_tools_without_secret_arguments() {
     let schema = serde_json::to_string(&sql_read.input_schema).unwrap();
     assert!(schema.contains("target"));
     assert!(schema.contains("filter"));
+
+    let sql_query = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == "sql_query")
+        .unwrap();
+    let schema = serde_json::to_string(&sql_query.input_schema).unwrap();
+    assert!(schema.contains("statement"));
+    assert!(!schema.contains("max_affected"));
 
     let all_schemas = serde_json::to_string(&listed.tools).unwrap();
     assert!(!all_schemas.contains("\"password\""));

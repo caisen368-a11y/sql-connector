@@ -2,8 +2,8 @@ use std::{
     collections::BTreeMap,
     path::Path,
     sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -18,9 +18,12 @@ use connector_core::{
     ResourceRule, ResultMetrics, SecretMaterial, TlsConfig, WriteOutcome,
 };
 use connector_policy::{AuthorizationClaims, GrantIssuer, GrantVerifier, canonical_arguments_hash};
-use connector_runtime::{ConnectorRegistry, ExecutionAuthorization, Runtime, RuntimeError};
+use connector_runtime::{
+    ConnectorRegistry, ExecutionAuthorization, RequestConcurrencyLimits, Runtime, RuntimeError,
+};
 use connector_store::{
     AuditQuery, AuditRepository, CredentialStore, InMemoryCredentialStore, ProfileRepository,
+    StoreError,
 };
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection as SqliteConnection;
@@ -30,6 +33,55 @@ use uuid::Uuid;
 struct FakeConnector {
     discover: bool,
     executions: Option<Arc<AtomicUsize>>,
+}
+
+struct BlockingCredentialStore {
+    secret: SecretMaterial,
+    get_started: AtomicBool,
+    released: Mutex<bool>,
+    released_changed: Condvar,
+}
+
+impl BlockingCredentialStore {
+    fn new(secret: SecretMaterial) -> Self {
+        Self {
+            secret,
+            get_started: AtomicBool::new(false),
+            released: Mutex::new(false),
+            released_changed: Condvar::new(),
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().expect("credential release poisoned") = true;
+        self.released_changed.notify_all();
+    }
+}
+
+impl CredentialStore for BlockingCredentialStore {
+    fn put(&self, _reference: &str, _secret: &SecretMaterial) -> connector_store::Result<()> {
+        Err(StoreError::Credential(
+            "blocking test credential store is read-only".into(),
+        ))
+    }
+
+    fn get(&self, _reference: &str) -> connector_store::Result<SecretMaterial> {
+        self.get_started.store(true, Ordering::Release);
+        let mut released = self.released.lock().expect("credential release poisoned");
+        while !*released {
+            released = self
+                .released_changed
+                .wait(released)
+                .expect("credential release poisoned");
+        }
+        Ok(self.secret.clone())
+    }
+
+    fn delete(&self, _reference: &str) -> connector_store::Result<()> {
+        Err(StoreError::Credential(
+            "blocking test credential store is read-only".into(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -396,6 +448,95 @@ fn build_persistent_write_runtime(
     .0
 }
 
+fn capacity_test_operation() -> DataOperation {
+    DataOperation::Read(ReadRequest {
+        target: "public.items".into(),
+        fields: vec![],
+        filter: None,
+        options: QueryOptions {
+            limit: 2,
+            ..QueryOptions::default()
+        },
+    })
+}
+
+fn capacity_test_authorization(operation: &DataOperation) -> ExecutionAuthorization {
+    ExecutionAuthorization {
+        subject: "user".into(),
+        session_id: "session".into(),
+        tool: "sql_read".into(),
+        arguments: serde_json::to_value(operation).unwrap(),
+        grant: None,
+    }
+}
+
+async fn saturated_runtime(
+    limits: RequestConcurrencyLimits,
+) -> (
+    Arc<Runtime>,
+    ConnectionId,
+    DataOperation,
+    tokio::task::JoinHandle<Result<OperationResult, RuntimeError>>,
+    Arc<AtomicUsize>,
+) {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let audit = Arc::new(AuditRepository::open_in_memory().unwrap());
+    let connection_id = ConnectionId::new();
+    let (runtime, _, _) = build_runtime_with_state(
+        false,
+        Vec::new(),
+        None,
+        DataEgress::LocalOnly,
+        30_000,
+        audit,
+        connection_id,
+        Some(Arc::clone(&executions)),
+    );
+    let runtime = Arc::new(runtime.with_request_concurrency_limits(limits));
+    let operation = capacity_test_operation();
+    let executing_runtime = Arc::clone(&runtime);
+    let executing_operation = operation.clone();
+    let execution = tokio::spawn(async move {
+        let authorization = capacity_test_authorization(&executing_operation);
+        executing_runtime
+            .execute_with_request_id(
+                connection_id,
+                executing_operation,
+                authorization,
+                Some("client-request-1".into()),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while executions.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    (runtime, connection_id, operation, execution, executions)
+}
+
+fn assert_busy(error: RuntimeError, message_fragment: &str) {
+    let RuntimeError::Connector(error) = error else {
+        panic!("runtime overload must use the connector error contract");
+    };
+    assert_eq!(error.category, connector_core::ErrorCategory::RateLimited);
+    assert_eq!(error.code.as_deref(), Some("busy"));
+    assert!(error.retryable);
+    assert!(error.message.contains(message_fragment));
+}
+
+fn assert_cancelled(error: RuntimeError) {
+    let RuntimeError::Connector(error) = error else {
+        panic!("cancelled runtime request must use the connector error contract");
+    };
+    assert_eq!(error.category, connector_core::ErrorCategory::Cancelled);
+    assert_eq!(error.phase, connector_core::ErrorPhase::Operation);
+    assert!(!error.retryable);
+    assert!(error.code.is_none());
+}
+
 #[test]
 fn capabilities_include_the_effective_connection_policy() {
     let (runtime, connection_id, _) = build_runtime();
@@ -405,6 +546,26 @@ fn capabilities_include_the_effective_connection_policy() {
     assert_eq!(capabilities.policy.max_rows, 2);
     assert_eq!(capabilities.policy_version, 1);
     assert_eq!(capabilities.connector.manifest.id, "test-postgresql");
+    let sql_query = capabilities
+        .effective_mcp_tools
+        .iter()
+        .find(|tool| tool.tool == "sql_query")
+        .unwrap();
+    assert!(sql_query.available);
+    assert!(sql_query.unavailable_reason.is_none());
+    let native_query = capabilities
+        .effective_mcp_tools
+        .iter()
+        .find(|tool| tool.tool == "native_query")
+        .unwrap();
+    assert!(!native_query.available);
+    assert!(
+        native_query
+            .unavailable_reason
+            .as_deref()
+            .unwrap()
+            .contains("disabled")
+    );
     assert_eq!(
         capabilities
             .connector
@@ -513,6 +674,78 @@ async fn disabled_native_read_reports_how_to_enable_read_only_queries() {
         error,
         RuntimeError::Policy(connector_policy::PolicyError::Denied(message))
             if message.contains("allow_native_read")
+    ));
+}
+
+#[tokio::test]
+async fn policy_scoped_sql_query_allows_joins_and_rejects_hidden_relations() {
+    let rule = |pattern: &str, allow_read| ResourceRule {
+        pattern: pattern.into(),
+        allow_read,
+        allow_insert: false,
+        allow_update: false,
+        allow_delete: false,
+        masked_fields: Vec::new(),
+    };
+    let (runtime, connection_id, _) = build_runtime_with(
+        false,
+        vec![
+            rule("public.orders", true),
+            rule("public.customers", true),
+            rule("private.*", false),
+        ],
+    );
+    let operation = |statement: &str| {
+        DataOperation::NativeQuery(NativeRequest {
+            language: "postgresql".into(),
+            statement: statement.into(),
+            parameters: BTreeMap::new(),
+            positional_parameters: vec![],
+            max_affected: None,
+            idempotency_key: None,
+        })
+    };
+    let authorized = operation(
+        "SELECT c.name, COUNT(*) FROM public.orders o JOIN public.customers c ON c.id = o.customer_id GROUP BY c.name",
+    );
+    let result = runtime
+        .execute(
+            connection_id,
+            authorized.clone(),
+            ExecutionAuthorization {
+                subject: "user".into(),
+                session_id: "session".into(),
+                tool: "sql_query".into(),
+                arguments: serde_json::to_value(&authorized).unwrap(),
+                grant: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.records.len(), 2);
+    assert!(result.truncated);
+
+    let denied = operation(
+        "WITH hidden AS (SELECT owner_id FROM private.users) SELECT o.id FROM public.orders o JOIN hidden h ON h.owner_id = o.id",
+    );
+    let error = runtime
+        .execute(
+            connection_id,
+            denied.clone(),
+            ExecutionAuthorization {
+                subject: "user".into(),
+                session_id: "session".into(),
+                tool: "sql_query".into(),
+                arguments: serde_json::to_value(&denied).unwrap(),
+                grant: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeError::Policy(connector_policy::PolicyError::Denied(message))
+            if message.contains("private.users")
     ));
 }
 
@@ -877,7 +1110,6 @@ async fn caller_request_id_is_forwarded_and_can_be_cancelled() {
                 Some("client-request-1".into()),
             )
             .await
-            .unwrap()
     });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert!(
@@ -890,8 +1122,7 @@ async fn caller_request_id_is_forwarded_and_can_be_cancelled() {
         .cancel(connection_id, "client-request-1", "session")
         .await
         .unwrap();
-    let result = execution.await.unwrap();
-    assert_eq!(result.request_id, "client-request-1");
+    assert_cancelled(execution.await.unwrap().unwrap_err());
     assert!(
         runtime
             .cancel(connection_id, "client-request-1", "session")
@@ -915,14 +1146,157 @@ async fn caller_request_id_is_forwarded_and_can_be_cancelled() {
                 Some("catalog-request-1".into()),
             )
             .await
-            .unwrap()
     });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     runtime
         .cancel(connection_id, "catalog-request-1", "session")
         .await
         .unwrap();
-    assert_eq!(search.await.unwrap().entities.len(), 2);
+    assert_cancelled(search.await.unwrap().unwrap_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_cancel_does_not_execute_or_consume_the_write_grant() {
+    let issuer = GrantIssuer::new(SigningKey::from_bytes(&[17; 32]));
+    let connection_id = ConnectionId::new();
+    let profiles = Arc::new(ProfileRepository::open_in_memory().unwrap());
+    profiles
+        .upsert(&ConnectionProfile {
+            id: connection_id,
+            display_name: "blocked credentials".into(),
+            product: Product::PostgreSql,
+            api_mode: "postgresql".into(),
+            endpoint: Url::parse("postgresql://localhost:5432").unwrap(),
+            database: None,
+            tags: vec![],
+            auth_kind: AuthKind::UsernamePassword,
+            secret_ref: "secret".into(),
+            tls: TlsConfig::default(),
+            policy: ConnectionPolicy {
+                max_rows: 2,
+                resources: writable_resources(),
+                ..ConnectionPolicy::default()
+            },
+            policy_version: 1,
+            expected_version: None,
+            options: BTreeMap::new(),
+        })
+        .unwrap();
+    let credentials = Arc::new(BlockingCredentialStore::new(SecretMaterial {
+        kind: AuthKind::UsernamePassword,
+        fields: BTreeMap::new(),
+    }));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut registry = ConnectorRegistry::new();
+    registry
+        .register(Arc::new(FakeConnector {
+            discover: false,
+            executions: Some(Arc::clone(&executions)),
+        }))
+        .unwrap();
+    let runtime = Arc::new(Runtime::new(
+        profiles,
+        Arc::clone(&credentials) as Arc<dyn CredentialStore>,
+        Arc::new(AuditRepository::open_in_memory().unwrap()),
+        Arc::new(registry),
+        Some(Arc::new(GrantVerifier::new(issuer.verifying_key()))),
+    ));
+    let operation = DataOperation::Insert(InsertRequest {
+        target: "public.items".into(),
+        records: vec![DbRecord::from([("id".into(), DbValue::Int64(1))])],
+        idempotency_key: None,
+    });
+    let authorization = write_authorization(
+        &issuer,
+        connection_id,
+        &operation,
+        "pending-cancel-write-grant",
+    );
+    let executing_runtime = Arc::clone(&runtime);
+    let executing_operation = operation.clone();
+    let executing_authorization = authorization.clone();
+    let execution = tokio::spawn(async move {
+        executing_runtime
+            .execute_with_request_id(
+                connection_id,
+                executing_operation,
+                executing_authorization,
+                Some("pending-write-1".into()),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !credentials.get_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    runtime
+        .cancel(connection_id, "pending-write-1", "session")
+        .await
+        .unwrap();
+    credentials.release();
+    assert_cancelled(execution.await.unwrap().unwrap_err());
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+    runtime
+        .execute_with_request_id(
+            connection_id,
+            operation,
+            authorization,
+            Some("pending-write-retry".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn connection_overload_is_rejected_while_cancel_remains_available() {
+    let (runtime, connection_id, operation, execution, executions) =
+        saturated_runtime(RequestConcurrencyLimits::new(2, 1)).await;
+
+    let error = runtime
+        .execute_with_request_id(
+            connection_id,
+            operation.clone(),
+            capacity_test_authorization(&operation),
+            Some("capacity-overflow".into()),
+        )
+        .await
+        .unwrap_err();
+    assert_busy(error, "connection request capacity");
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+
+    runtime
+        .cancel(connection_id, "client-request-1", "session")
+        .await
+        .unwrap();
+    assert_cancelled(execution.await.unwrap().unwrap_err());
+}
+
+#[tokio::test]
+async fn global_overload_is_rejected_before_connector_execution() {
+    let (runtime, connection_id, operation, execution, executions) =
+        saturated_runtime(RequestConcurrencyLimits::new(1, 1)).await;
+
+    let error = runtime
+        .execute_with_request_id(
+            connection_id,
+            operation.clone(),
+            capacity_test_authorization(&operation),
+            Some("global-capacity-overflow".into()),
+        )
+        .await
+        .unwrap_err();
+    assert_busy(error, "runtime request capacity");
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        execution.await.unwrap().unwrap().request_id,
+        "client-request-1"
+    );
 }
 
 #[tokio::test]

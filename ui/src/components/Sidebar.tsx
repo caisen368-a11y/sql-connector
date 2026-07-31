@@ -6,15 +6,14 @@ import {
   Settings,
   Trash2,
 } from "lucide-react";
-import type { AppView, Conversation, McpStatus } from "../types";
-import { formatRelativeTime, McpIndicator } from "./Common";
+import type { AppView, Conversation } from "../types";
+import { formatRelativeTime } from "./Common";
 
 interface SidebarProps {
   collapsed: boolean;
   conversations: Conversation[];
   activeConversationId: string | null;
   activeView: AppView;
-  mcp: McpStatus;
   onToggle: () => void;
   onNewConversation: () => void;
   onSelectConversation: (id: string) => void;
@@ -27,7 +26,6 @@ export function Sidebar({
   conversations,
   activeConversationId,
   activeView,
-  mcp,
   onToggle,
   onNewConversation,
   onSelectConversation,
@@ -114,12 +112,6 @@ export function Sidebar({
           {!collapsed && <span>设置</span>}
         </button>
       </nav>
-
-      {!collapsed && (
-        <div className="sidebar-status">
-          <McpIndicator mcp={mcp} />
-        </div>
-      )}
     </aside>
   );
 }

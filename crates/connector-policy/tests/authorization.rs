@@ -145,6 +145,153 @@ fn native_read_allows_read_only_ctes_but_rejects_modifying_ctes() {
 }
 
 #[test]
+fn policy_scoped_sql_query_authorizes_every_base_relation() {
+    let mut policy = ConnectionPolicy::default();
+    policy.resources.extend([
+        ResourceRule {
+            pattern: "public.*".into(),
+            allow_read: true,
+            allow_insert: false,
+            allow_update: false,
+            allow_delete: false,
+            masked_fields: vec![],
+        },
+        ResourceRule {
+            pattern: "audit.events".into(),
+            allow_read: true,
+            allow_insert: false,
+            allow_update: false,
+            allow_delete: false,
+            masked_fields: vec![],
+        },
+    ]);
+    let request = NativeRequest {
+        language: "postgresql".into(),
+        statement: r"
+            WITH recent AS (
+                SELECT users.id
+                FROM public.users AS users
+                JOIN audit.events AS events ON events.user_id = users.id
+            ), enriched AS (
+                SELECT recent.id
+                FROM recent
+                JOIN (SELECT user_id FROM public.profiles) AS profiles
+                    ON profiles.user_id = recent.id
+            )
+            SELECT enriched.id
+            FROM enriched
+            JOIN public.orders AS orders ON orders.user_id = enriched.id
+            WHERE EXISTS (
+                SELECT 1 FROM public.flags AS flags WHERE flags.user_id = enriched.id
+            )
+        "
+        .into(),
+        parameters: BTreeMap::new(),
+        positional_parameters: vec![],
+        max_affected: None,
+        idempotency_key: None,
+    };
+
+    assert!(!policy.allow_native_read);
+    assert_eq!(
+        PolicyEngine::evaluate_sql_query(&policy, &request).unwrap(),
+        vec![
+            "audit.events",
+            "public.flags",
+            "public.orders",
+            "public.profiles",
+            "public.users"
+        ]
+    );
+}
+
+#[test]
+fn policy_scoped_sql_query_resolves_cte_scope_without_hiding_base_tables() {
+    let policy = ConnectionPolicy::default();
+    let request = |statement: &str| NativeRequest {
+        language: "postgresql".into(),
+        statement: statement.into(),
+        parameters: BTreeMap::new(),
+        positional_parameters: vec![],
+        max_affected: None,
+        idempotency_key: None,
+    };
+
+    assert_eq!(
+        PolicyEngine::evaluate_sql_query(
+            &policy,
+            &request("WITH users AS (SELECT * FROM users) SELECT * FROM users"),
+        )
+        .unwrap(),
+        vec!["users"]
+    );
+    assert_eq!(
+        PolicyEngine::evaluate_sql_query(
+            &policy,
+            &request(
+                "WITH RECURSIVE tree AS (\
+                 SELECT id, parent_id FROM public.nodes WHERE parent_id IS NULL \
+                 UNION ALL \
+                 SELECT nodes.id, nodes.parent_id FROM public.nodes AS nodes \
+                 JOIN tree ON nodes.parent_id = tree.id) \
+                 SELECT * FROM tree",
+            ),
+        )
+        .unwrap(),
+        vec!["public.nodes"]
+    );
+}
+
+#[test]
+fn policy_scoped_sql_query_denies_unapproved_or_unresolvable_relations() {
+    let mut policy = ConnectionPolicy::default();
+    policy.resources.push(ResourceRule {
+        pattern: "public.*".into(),
+        allow_read: true,
+        allow_insert: false,
+        allow_update: false,
+        allow_delete: false,
+        masked_fields: vec![],
+    });
+    let request = |statement: &str| NativeRequest {
+        language: "postgresql".into(),
+        statement: statement.into(),
+        parameters: BTreeMap::new(),
+        positional_parameters: vec![],
+        max_affected: None,
+        idempotency_key: None,
+    };
+
+    assert!(matches!(
+        PolicyEngine::evaluate_sql_query(
+            &policy,
+            &request("SELECT * FROM public.users JOIN private.secrets USING (id)"),
+        ),
+        Err(PolicyError::Denied(_))
+    ));
+    for statement in [
+        "SELECT * FROM generate_series(1, 3)",
+        "SELECT * FROM UNNEST(ARRAY[1, 2])",
+        "SELECT * INTO copied_users FROM public.users",
+        "SELECT * FROM public.users FOR UPDATE",
+    ] {
+        assert!(matches!(
+            PolicyEngine::evaluate_sql_query(&policy, &request(statement)),
+            Err(PolicyError::InvalidOperation(_))
+        ));
+    }
+
+    let masked_policy = ConnectionPolicy {
+        egress: DataEgress::CloudAllowedMasked,
+        ..policy
+    };
+    assert!(matches!(
+        PolicyEngine::evaluate_sql_query(&masked_policy, &request("SELECT * FROM public.users"),),
+        Err(PolicyError::Denied(_))
+    ));
+}
+
+#[test]
 fn native_write_requires_a_bounded_affected_count() {
     let policy = ConnectionPolicy {
         allow_native_write: true,

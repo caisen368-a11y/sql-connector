@@ -151,6 +151,19 @@ impl WorkerClient {
         }
         Ok(())
     }
+
+    pub(crate) async fn terminate(&self) -> Result<()> {
+        let mut child = self.child.lock().await;
+        if child.try_wait()?.is_none() {
+            child.start_kill()?;
+        }
+        child.wait().await?;
+        drop(child);
+        if let Some(reader_task) = self.reader_task.lock().await.take() {
+            let _ = reader_task.await;
+        }
+        Ok(())
+    }
 }
 
 async fn read_responses(

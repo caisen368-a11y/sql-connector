@@ -10,8 +10,8 @@ mod value;
 pub use capability::{
     AuthenticationInputHints, Capability, ConnectionCapabilities, ConnectionInputHints,
     ConnectionOptionHints, ConnectionOptionType, ConnectorDescriptor, ConnectorManifest,
-    ConnectorStatus, McpToolRoute, ResourceTargetFormat, ResourceTargetHints, ResourceTargetKind,
-    TIME_SERIES_QUERY_POLICY_TARGET, TlsInputHints, TlsMode,
+    ConnectorStatus, EffectiveMcpTool, McpToolRoute, ResourceTargetFormat, ResourceTargetHints,
+    ResourceTargetKind, TIME_SERIES_QUERY_POLICY_TARGET, TlsInputHints, TlsMode,
 };
 pub use config::{
     AuthKind, ConnectionId, ConnectionPolicy, ConnectionProfile, DataEgress, Product, ResourceRule,
@@ -24,7 +24,8 @@ pub use connector::{
 pub use error::{ConnectorError, ErrorCategory, ErrorPhase, Result};
 pub use operation::{
     DataOperation, DeleteRequest, Filter, InsertRequest, NativeRequest, QueryOptions, ReadRequest,
-    SearchRequest, SortDirection, SortField, TimeSeriesPoint, TimeSeriesWriteRequest,
-    UpdateRequest, VectorPoint, VectorSearchRequest, VectorUpsertRequest, WriteOutcome,
+    SearchRequest, SortDirection, SortField, SqlQueryRequest, TimeSeriesPoint,
+    TimeSeriesWriteRequest, UpdateRequest, VectorPoint, VectorSearchRequest, VectorUpsertRequest,
+    WriteOutcome,
 };
 pub use value::{DbRecord, DbValue, OperationResult, ResultMetrics};

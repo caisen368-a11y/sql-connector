@@ -79,7 +79,9 @@ The trusted desktop host can create and manage profiles by sending one JSON
 object to `control` over stdin. Secrets must never be placed in command-line
 arguments, profile URLs, logs, or MCP messages. See
 [configuration](docs/configuration.md) for request examples and secret field
-conventions.
+conventions. A complete Chinese guide for embedding the binary in another
+Windows or macOS desktop product is available in
+[第三方 UI 集成指南](docs/ui-integration-guide.zh-CN.md).
 
 For the normal first-run flow, `add-connection` accepts a compact draft on
 stdin, tests the real endpoint, and saves it only after the test succeeds. It

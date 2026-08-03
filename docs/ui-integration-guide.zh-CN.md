@@ -49,12 +49,10 @@ React/Vue/原生 UI
 https://github.com/caisen368-a11y/sql-connector/releases
 ```
 
-本指南要求 `46e9ac9` 或更晚代码中的协议和功能。当前已有的独立 connector Release
-`v0.1.0` 早于这些改动，不支持 SQLite 凭据参数、`db_inspect_schema` 和 `sql_query`，
-不能按本文直接接入。在出现包含 `46e9ac9` 或更晚提交的新 `v*` Release 之前，请从当前
-源码构建。下载 Release 后先核对同名 `.sha256`；生产产品应固定兼容提交和归档
-SHA-256，不要在运行时下载 `main` 的未知二进制。当前新旧构建的 `--version` 都可能显示
-`0.1.0`，所以不能只靠版本字符串判断协议兼容性。
+本指南以独立 connector Release `v0.2.0` 为最低兼容版本。旧版 `v0.1.0` 不支持 SQLite
+凭据参数、`db_inspect_schema` 和 `sql_query`，不能按本文直接接入。下载 Release 后先核对
+同名 `.sha256`；生产产品应固定兼容版本和归档 SHA-256，不要在运行时下载 `main` 的未知
+二进制。升级时仍应按第 16 节验证实际 CLI 和 MCP capabilities，不能只比较版本字符串。
 
 独立二进制 Release 使用 `v*` 标签，工作流产物名称为：
 

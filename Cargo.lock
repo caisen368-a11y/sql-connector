@@ -534,7 +534,7 @@ checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 
 [[package]]
 name = "connector-control"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -553,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "connector-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "connector-ipc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "connector-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "connector-policy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "connector-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -656,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "connector-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "chrono",
@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "connectors-document"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "connectors-http"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "connectors-sql"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "connectors-timeseries"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4377,7 +4377,7 @@ dependencies = [
 
 [[package]]
 name = "sql-connector"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
